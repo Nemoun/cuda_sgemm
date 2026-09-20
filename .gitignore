@@ -1,0 +1,15 @@
+# 编译产物
+sgemm
+sgemm.exe
+vector_add
+*.o
+*.out
+
+# 运行输出
+*.bin
+
+# Python
+__pycache__/
+
+# 对话记录
+chat.md
