@@ -42,7 +42,7 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 
 - [x] 环境跑通（vector_add）
 - [x] 0. naive GEMM —— 三重循环，起点 219.64 GFLOPS（cuBLAS 的 2.16%）（`kernels/naive.cuh`）
-- [ ] 1. global memory 合并访问
+- [x] 1. global memory 合并访问 —— 5.2× naive（`kernels/1_global_memory.cuh`）
 - [ ] 2. shared memory tiling
 - [ ] 3. blocktiling + float4 向量化
 - [ ] 4. 消除 bank conflict（padding / swizzle）
@@ -54,11 +54,17 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 
 | kernel | 1024³ GFLOPS | 1024³ 耗时 | 4096³ GFLOPS | 4096³ 耗时 |
 |---|---|---|---|---|
-| naive | 219.64 | 9.777 ms | 299.05 | 459.578 ms |
-| cuBLAS | 10180.35 | 0.211 ms | 13832.60 | 9.936 ms |
+| naive | 235.05 | 9.136 ms | 303.57 | 452.735 ms |
+| coalesced | 1224.26 | 1.754 ms | 1063.05 | 129.287 ms |
+| cuBLAS | 9664.30 | 0.222 ms | 11505.37 | 11.946 ms |
 
-两种尺寸下 naive 均为 cuBLAS 的约 2.16%（cuBLAS 快约 46 倍）。
+合并访问相对 naive 加速 5.2×（1024³）/ 3.5×（4096³）。数值为最近一次运行的实测，
+笔记本环境受功耗墙影响有波动，看同一次运行的比值更有意义。
 4096³ 时 CPU 对拍会自动跳过（`main.cu` 中 M×N×K > 2^30 即跳过，CPU 三重循环太慢），只保留 cuBLAS 对拍。
+
+ncu 瓶颈对比（1024³）：naive 的 L1/TEX 被 32 个碎片请求/warp 打满（DRAM 仅 5.4%），
+Compute(SM) 只有 22.9%；合并访问后请求变整块，kernel 快 5 倍，瓶颈转移到
+Compute(SM) 98.3%——「每算 1 个 FMA 要发 2 条 load」，下一步 shared memory tiling 就是来解决它的。
 
 ## 参考
 
