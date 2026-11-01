@@ -13,6 +13,7 @@
 
 #include "kernels/naive.cuh"
 #include "kernels/1_global_memory.cuh"
+#include "kernels/2_shared_memory.cuh"
 
 // CUDA API 错误检查
 #define CHECK(call)                                                            \
@@ -144,9 +145,10 @@ int main(int argc, char **argv) {
   float *h_b = (float *)malloc(bytes_b);
   float *h_c = (float *)malloc(bytes_c);
   float *h_c2 = (float *)malloc(bytes_c);
+  float *h_c3 = (float *)malloc(bytes_c);
   float *h_ref = (float *)malloc(bytes_c);
   float *h_cblas = (float *)malloc(bytes_c);
-  if (!h_a || !h_b || !h_c || !h_c2 || !h_ref || !h_cblas) {
+  if (!h_a || !h_b || !h_c || !h_c2 || !h_c3 || !h_ref || !h_cblas) {
     fprintf(stderr, "host malloc failed\n");
     return EXIT_FAILURE;
   }
@@ -182,6 +184,17 @@ int main(int argc, char **argv) {
          gflops_coalesced, gflops_coalesced / gflops);
   CHECK(cudaMemcpy(h_c2, d_c, bytes_c, cudaMemcpyDeviceToHost));
 
+  // ---- 1c. kernel 2：shared memory tiling ----
+  launch_sgemm_shared_memory(d_a, d_b, d_c, M, N, K);  // 预热，同时暴露启动配置错误
+  CHECK(cudaGetLastError());
+  CHECK(cudaDeviceSynchronize());
+  float ms_smem =
+      time_ms([&] { launch_sgemm_shared_memory(d_a, d_b, d_c, M, N, K); }, 3);
+  double gflops_smem = 2.0 * M * N * K / (ms_smem * 1e6);
+  printf("smem:     %9.3f ms  %10.2f GFLOPS  (%.2fx naive)\n", ms_smem,
+         gflops_smem, gflops_smem / gflops);
+  CHECK(cudaMemcpy(h_c3, d_c, bytes_c, cudaMemcpyDeviceToHost));
+
   // ---- 2. CPU 参考对拍（尺寸太大则跳过，避免 CPU 跑太久） ----
   if ((size_t)M * N * K <= (size_t)1 << 30) {
     sgemm_cpu(h_a, h_b, h_ref, M, N, K);
@@ -199,6 +212,14 @@ int main(int argc, char **argv) {
            bad_c == 0 ? "PASS" : "FAIL", rel_c);
     if (bad_c) {
       printf("  不一致的元素: %d\n", bad_c);
+      return EXIT_FAILURE;
+    }
+    float rel_s = 0.0f;
+    int bad_s = check_against(h_c3, h_ref, M * N, &rel_s);
+    printf("CPU 对拍 (smem): %s (max rel err = %.2e)\n",
+           bad_s == 0 ? "PASS" : "FAIL", rel_s);
+    if (bad_s) {
+      printf("  不一致的元素: %d\n", bad_s);
       return EXIT_FAILURE;
     }
   } else {
@@ -242,9 +263,17 @@ int main(int argc, char **argv) {
     printf("  不一致的元素: %d\n", bad3);
     return EXIT_FAILURE;
   }
+  float rel4 = 0.0f;
+  int bad4 = check_against(h_c3, h_cblas, M * N, &rel4);
+  printf("cuBLAS 对拍 (smem): %s (max rel err = %.2e)\n",
+         bad4 == 0 ? "PASS" : "FAIL", rel4);
+  if (bad4) {
+    printf("  不一致的元素: %d\n", bad4);
+    return EXIT_FAILURE;
+  }
 
-  // ---- 5. 可选 dump（h_c 是 kernel 结果，cuBLAS 之前已拷出） ----
-  if (dump_path) dump(dump_path, h_c, M, N, K);
+  // ---- 5. 可选 dump（h_c3 是当前最新 kernel 的结果，供 bench.py 对拍） ----
+  if (dump_path) dump(dump_path, h_c3, M, N, K);
 
   CHECK_CUBLAS(cublasDestroy(handle));
   CHECK(cudaFree(d_a));
@@ -254,6 +283,7 @@ int main(int argc, char **argv) {
   free(h_b);
   free(h_c);
   free(h_c2);
+  free(h_c3);
   free(h_ref);
   free(h_cblas);
   return EXIT_SUCCESS;
