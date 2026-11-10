@@ -3,7 +3,8 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 
-// tile 尺寸
+// tile 尺寸（常量放进 namespace，避免与其他 kernel 头文件的常量重名）
+namespace sgemm_k2 {
 constexpr int BM = 16;  // C tile 行数
 constexpr int BN = 16;  // C tile 列数
 constexpr int BK = 16;  // K 方向分块宽度
@@ -49,9 +50,12 @@ __global__ void sgemm_shared_memory(int M, int N, int K, const float *A, const f
   }
 }
 
+}  // namespace sgemm_k2
+
 void launch_sgemm_shared_memory(const float *A, const float *B, float *C,
                                 int M, int N, int K) {
-  dim3 blockDim(BN, BM, 1);
-  dim3 gridDim((N + BN - 1) / BN, (M + BM - 1) / BM, 1);
-  sgemm_shared_memory<<<gridDim, blockDim>>>(M, N, K, A, B, C);
+  dim3 blockDim(sgemm_k2::BN, sgemm_k2::BM, 1);
+  dim3 gridDim((N + sgemm_k2::BN - 1) / sgemm_k2::BN,
+               (M + sgemm_k2::BM - 1) / sgemm_k2::BM, 1);
+  sgemm_k2::sgemm_shared_memory<<<gridDim, blockDim>>>(M, N, K, A, B, C);
 }

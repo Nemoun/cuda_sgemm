@@ -44,31 +44,35 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 - [x] 0. naive GEMM —— 三重循环，起点 219.64 GFLOPS（cuBLAS 的 2.16%）（`kernels/naive.cuh`）
 - [x] 1. global memory 合并访问 —— 5.2× naive（`kernels/1_global_memory.cuh`）
 - [x] 2. shared memory tiling —— 7.3× naive（`kernels/2_shared_memory.cuh`）
-- [ ] 3. blocktiling + float4 向量化
-- [ ] 4. 消除 bank conflict（padding / swizzle）
-- [ ] 5. warp tiling / double buffering
-- [ ] 6. Tensor Core（wmma）
-- [ ] 7. autotuning + Nsight Compute 分析 + roofline 图
+- [x] 3. 1D blocktiling（寄存器分块）—— 19× naive（`kernels/3_1d_blocktiling.cuh`）
+- [ ] 4. 2D blocktiling（TM×TN 寄存器分块）
+- [ ] 5. float4 向量化搬运（顺带处理 bank conflict）
+- [ ] 6. warp tiling / double buffering
+- [ ] 7. Tensor Core（wmma）
+- [ ] 8. autotuning + roofline 图
 
 ## 性能记录
 
 | kernel | 1024³ GFLOPS | 1024³ 耗时 | 4096³ GFLOPS | 4096³ 耗时 |
 |---|---|---|---|---|
-| naive | 218.98 | 9.807 ms | 300.67 | 457.103 ms |
-| coalesced | 1222.83 | 1.756 ms | 1053.20 | 130.497 ms |
-| smem | 1598.44 | 1.343 ms | 1450.85 | 94.730 ms |
-| cuBLAS | 9939.11 | 0.216 ms | 13862.60 | 9.914 ms |
+| naive | 223.77 | 9.597 ms | 300.31 | 457.665 ms |
+| coalesced | 1225.69 | 1.752 ms | 1061.18 | 129.515 ms |
+| smem | 1597.22 | 1.345 ms | 1445.63 | 95.072 ms |
+| 1dblock | 4245.25 | 0.506 ms | 4558.27 | 30.152 ms |
+| cuBLAS | 10038.72 | 0.214 ms | 13797.05 | 9.961 ms |
 
-同一次运行的加速比（相对 naive）：coalesced 5.6×（1024³）/ 3.5×（4096³），
-smem 7.3×（1024³）/ 4.8×（4096³）。数值为最近一次运行的实测，
+同一次运行的加速比（相对 naive，1024³）：coalesced 5.5×、smem 7.1×、1dblock **19.0×**。
+4096³ 依次为 3.5× / 4.8× / 15.2×。数值为最近一次运行的实测，
 笔记本环境受功耗墙影响有波动，看同一次运行的比值更有意义。
 4096³ 时 CPU 对拍会自动跳过（`main.cu` 中 M×N×K > 2^30 即跳过，CPU 三重循环太慢），只保留 cuBLAS 对拍。
 
 ncu 数据（1024³）：naive 的瓶颈是 L1/TEX 被 32 个碎片请求/warp 打满（DRAM 仅 5.4%）；
-合并访问后请求变整块，瓶颈转移到 Compute(SM) 98.3%——每 FMA 配 2 条 load；
-smem 版把 load 搬进 shared memory（DRAM 降到 3.5%，occupancy 97.9%，bank conflict 实测 0），
-但「2 条 smem load 配 1 个 FMA」的比例没变，瓶颈仍在访存发射。
-下一步 2D blocktiling（寄存器分块）把 load:FMA 降到 2:(TM×TN)，float4 向量化加快搬运。
+合并访问后瓶颈转移到 Compute(SM) 98.3%——每 FMA 配 2 条 load；
+smem 版把 load 搬进 shared memory，但 2:1 的 load:FMA 没变，瓶颈仍在访存发射；
+1dblock 用 TM=8 个寄存器累加器把 load:FMA 压到约 1:1，GFLOPS 翻 2.7 倍，
+此时 Compute 72.5% / DRAM 29% / L1/TEX 78.7%，没有单一瓶颈打满；
+occupancy 62%（受寄存器数量限制，2 blocks/SM），ncu 提示仍有 ~33% 提升空间——
+下一步 2D blocktiling（TM×TN）继续摊薄 load，float4 向量化加快搬运。
 
 ## 参考
 
