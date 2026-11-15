@@ -5,7 +5,7 @@
 ## 环境
 
 - GPU：NVIDIA GeForce RTX 4070 Laptop GPU（Ada，compute capability **89**）
-- CUDA Toolkit 12.6（WSL2 Ubuntu 24.04，仓库与开发均在 WSL 内）
+- CUDA Toolkit 12.6
 - 编译命令见 `build.sh`
 
 ## 快速开始
@@ -45,7 +45,7 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 - [x] 1. global memory 合并访问 —— 5.2× naive（`kernels/1_global_memory.cuh`）
 - [x] 2. shared memory tiling —— 7.3× naive（`kernels/2_shared_memory.cuh`）
 - [x] 3. 1D blocktiling（寄存器分块）—— 19× naive（`kernels/3_1d_blocktiling.cuh`）
-- [ ] 4. 2D blocktiling（TM×TN 寄存器分块）
+- [x] 4. 2D blocktiling（TM×TN 寄存器分块）—— 26.5× naive（`kernels/4_2d_blocktiling.cuh`）
 - [ ] 5. float4 向量化搬运（顺带处理 bank conflict）
 - [ ] 6. warp tiling / double buffering
 - [ ] 7. Tensor Core（wmma）
@@ -55,24 +55,26 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 
 | kernel | 1024³ GFLOPS | 1024³ 耗时 | 4096³ GFLOPS | 4096³ 耗时 |
 |---|---|---|---|---|
-| naive | 223.77 | 9.597 ms | 300.31 | 457.665 ms |
-| coalesced | 1225.69 | 1.752 ms | 1061.18 | 129.515 ms |
-| smem | 1597.22 | 1.345 ms | 1445.63 | 95.072 ms |
-| 1dblock | 4245.25 | 0.506 ms | 4558.27 | 30.152 ms |
-| cuBLAS | 10038.72 | 0.214 ms | 13797.05 | 9.961 ms |
+| naive | 216.81 | 9.905 ms | 302.96 | 453.652 ms |
+| coalesced | 1224.35 | 1.754 ms | 1044.89 | 131.534 ms |
+| smem | 1592.37 | 1.349 ms | 1432.16 | 95.966 ms |
+| 1dblock | 4246.86 | 0.506 ms | 4657.59 | 29.509 ms |
+| 2dblock | 5745.62 | 0.374 ms | 7340.72 | 18.723 ms |
+| cuBLAS | 10746.02 | 0.200 ms | 13094.41 | 10.496 ms |
 
-同一次运行的加速比（相对 naive，1024³）：coalesced 5.5×、smem 7.1×、1dblock **19.0×**。
-4096³ 依次为 3.5× / 4.8× / 15.2×。数值为最近一次运行的实测，
+同一次运行的加速比（相对 naive，1024³）：coalesced 5.7×、smem 7.3×、1dblock 19.6×、
+2dblock **26.5×**。4096³ 依次为 3.5× / 4.7× / 15.4× / 24.2×。数值为最近一次运行的实测，
 笔记本环境受功耗墙影响有波动，看同一次运行的比值更有意义。
 4096³ 时 CPU 对拍会自动跳过（`main.cu` 中 M×N×K > 2^30 即跳过，CPU 三重循环太慢），只保留 cuBLAS 对拍。
 
 ncu 数据（1024³）：naive 的瓶颈是 L1/TEX 被 32 个碎片请求/warp 打满（DRAM 仅 5.4%）；
 合并访问后瓶颈转移到 Compute(SM) 98.3%——每 FMA 配 2 条 load；
 smem 版把 load 搬进 shared memory，但 2:1 的 load:FMA 没变，瓶颈仍在访存发射；
-1dblock 用 TM=8 个寄存器累加器把 load:FMA 压到约 1:1，GFLOPS 翻 2.7 倍，
-此时 Compute 72.5% / DRAM 29% / L1/TEX 78.7%，没有单一瓶颈打满；
-occupancy 62%（受寄存器数量限制，2 blocks/SM），ncu 提示仍有 ~33% 提升空间——
-下一步 2D blocktiling（TM×TN）继续摊薄 load，float4 向量化加快搬运。
+1dblock 用 TM=8 个寄存器累加器把 load:FMA 压到约 1:1，GFLOPS 翻 2.7 倍（Compute 72.5%）；
+2dblock 用 TM×TN=64 个累加器把 load:FMA 压到 1:4，Compute 降到 43.6%，
+此时最忙的部件变成 L1/TEX 71%（内积每 dotIdx 16 次 LDS + Bs 行读取的 4-way bank conflict）；
+occupancy 只有 28%（寄存器限制）但 ILP 补了回来，GFLOPS 仍大涨——
+下一步 float4 向量化搬运 + 消除 bank conflict（教程 kernel 6/7）。
 
 ## 参考
 
