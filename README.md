@@ -48,26 +48,28 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 - [x] 4. 2D blocktiling（TM×TN 寄存器分块）—— 26.5× naive（`kernels/4_2d_blocktiling.cuh`）
 - [x] 5. float4 向量化搬运 —— 29.6× naive（`kernels/5_vectorize.cuh`）
 - [x] 6. 消除 bank conflict + smem 读向量化 —— 31× naive，收益有限（见性能记录）（`kernels/6_bank_conflict.cuh`）
-- [ ] 7. warp tiling / double buffering
-- [ ] 8. Tensor Core（wmma）
-- [ ] 9. autotuning + roofline 图
+- [x] 7. warp tiling —— 26× naive，A6000 配置在 4070 Laptop 上慢于 vectorized（见性能记录）（`kernels/7_warptiling.cuh`）
+- [ ] 8. double buffering（cp.async）
+- [ ] 9. autotuning（扫 warp tiling 参数）+ roofline 图
+- [ ] 10. Tensor Core（wmma）
 
 ## 性能记录
 
 | kernel | 1024³ GFLOPS | 1024³ 耗时 | 4096³ GFLOPS | 4096³ 耗时 |
 |---|---|---|---|---|
-| naive | 269.66 | 7.964 ms | 303.18 | 453.323 ms |
-| coalesced | 1222.34 | 1.757 ms | 1063.34 | 129.252 ms |
-| smem | 1592.37 | 1.349 ms | 1459.06 | 94.197 ms |
-| 1dblock | 4253.86 | 0.505 ms | 4454.20 | 30.856 ms |
-| 2dblock | 5583.56 | 0.385 ms | 7220.67 | 19.034 ms |
-| vectorized | 7389.22 | 0.291 ms | 9118.67 | 15.072 ms |
-| nobank | 8355.19 | 0.257 ms | 8966.51 | 15.328 ms |
-| cuBLAS | 10228.45 | 0.210 ms | 13341.72 | 10.301 ms |
+| naive | 268.12 | 8.010 ms | 305.48 | 449.916 ms |
+| coalesced | 1225.69 | 1.752 ms | 1079.86 | 127.275 ms |
+| smem | 1596.08 | 1.345 ms | 1433.98 | 95.844 ms |
+| 1dblock | 4273.63 | 0.502 ms | 4629.01 | 29.691 ms |
+| 2dblock | 5745.62 | 0.374 ms | 7099.21 | 19.360 ms |
+| vectorized | 8128.50 | 0.264 ms | 8921.09 | 15.406 ms |
+| nobank | 8559.80 | 0.251 ms | 9307.87 | 14.766 ms |
+| warp | 7013.89 | 0.306 ms | 6385.59 | 21.523 ms |
+| cuBLAS | 10645.44 | 0.202 ms | 13852.59 | 9.922 ms |
 
-同一次运行的加速比（相对 naive，1024³）：coalesced 4.5×、smem 5.9×、1dblock 15.8×、
-2dblock 20.7×、vectorized 27.4×、nobank **31.0×**。4096³ 依次为 3.5× / 4.8× / 14.7× /
-23.8× / 30.1× / 29.6×。4096³ 下 vectorized 已达到 cuBLAS 的 68%。
+同一次运行的加速比（相对 naive，1024³）：coalesced 4.6×、smem 6.0×、1dblock 15.9×、
+2dblock 21.4×、vectorized 30.3×、nobank **31.9×**、warp 26.2×。4096³ 依次为 3.5× / 4.7× /
+15.2× / 23.2× / 29.2× / 30.5× / 20.9×。4096³ 下 nobank 已达到 cuBLAS 的 67%。
 数值为最近一次运行的实测，笔记本环境受功耗墙影响有波动，看同一次运行的比值更有意义。
 4096³ 时 CPU 对拍会自动跳过（`main.cu` 中 M×N×K > 2^30 即跳过，CPU 三重循环太慢），只保留 cuBLAS 对拍。
 
@@ -81,7 +83,12 @@ nobank 用 swizzle 布局（Bs4 按 float4 单位重排）+ 内积 LDS.128，实
 但 Bs4 的散列存储带来 52 万次**存储冲突**，整体收益有限且不稳定
 （1024³ +13%、4096³ −1.7%，ncu 下对比还会翻转）——与教程作者在 A6000 上的
 经验一致，这也是文章跳过 bank conflict 章节直接讲 autotuning 的原因。
-下一步：warp tiling / double buffering（教程 kernel 10/11，通常是真正的收益点）。
+warp tiling（教程 kernel 10 的 A6000 配置：128 线程、128 个寄存器累加器）在
+4070 Laptop 上**慢于 vectorized**：occupancy 只有 16.7%（寄存器限制 2 blocks/SM），
+8 warps/SM 遮不住访存延迟，所有吞吐指标都 <50%（Compute 40.5%）——A6000 的
+「重 ILP 轻 occupancy」配置在我们这块 46 SM 的笔记本芯片上水土不服。
+这正是下一步 autotuning 要解决的问题：warp tiling 的收益高度依赖
+(THREADS, WM, WN, TM, TN) 参数与具体硬件的匹配。
 
 ## 参考
 
