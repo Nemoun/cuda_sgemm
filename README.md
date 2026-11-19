@@ -49,7 +49,7 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 - [x] 5. float4 向量化搬运 —— 29.6× naive（`kernels/5_vectorize.cuh`）
 - [x] 6. 消除 bank conflict + smem 读向量化 —— 31× naive，收益有限（见性能记录）（`kernels/6_bank_conflict.cuh`）
 - [x] 7. warp tiling —— 26× naive，A6000 配置在 4070 Laptop 上慢于 vectorized（见性能记录）（`kernels/7_warptiling.cuh`）
-- [ ] 8. double buffering（cp.async）
+- [x] 8. double buffering（cp.async）—— 23.8× / 26.4× naive，重叠收益随 DRAM 延迟增大而显现（见性能记录）（`kernels/8_double_buffering.cuh`）
 - [ ] 9. autotuning（扫 warp tiling 参数）+ roofline 图
 - [ ] 10. Tensor Core（wmma）
 
@@ -57,20 +57,21 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 
 | kernel | 1024³ GFLOPS | 1024³ 耗时 | 4096³ GFLOPS | 4096³ 耗时 |
 |---|---|---|---|---|
-| naive | 268.12 | 8.010 ms | 305.48 | 449.916 ms |
-| coalesced | 1225.69 | 1.752 ms | 1079.86 | 127.275 ms |
-| smem | 1596.08 | 1.345 ms | 1433.98 | 95.844 ms |
-| 1dblock | 4273.63 | 0.502 ms | 4629.01 | 29.691 ms |
-| 2dblock | 5745.62 | 0.374 ms | 7099.21 | 19.360 ms |
-| vectorized | 8128.50 | 0.264 ms | 8921.09 | 15.406 ms |
-| nobank | 8559.80 | 0.251 ms | 9307.87 | 14.766 ms |
-| warp | 7013.89 | 0.306 ms | 6385.59 | 21.523 ms |
-| cuBLAS | 10645.44 | 0.202 ms | 13852.59 | 9.922 ms |
+| naive | 268.04 | 8.012 ms | 306.19 | 448.868 ms |
+| coalesced | 1217.86 | 1.763 ms | 1041.43 | 131.971 ms |
+| smem | 1594.07 | 1.347 ms | 1433.75 | 95.860 ms |
+| 1dblock | 4271.19 | 0.503 ms | 4603.43 | 29.856 ms |
+| 2dblock | 5698.78 | 0.377 ms | 7137.34 | 19.256 ms |
+| vectorized | 8104.94 | 0.265 ms | 8853.41 | 15.524 ms |
+| nobank | 8435.00 | 0.255 ms | 8888.00 | 15.463 ms |
+| warp | 6969.45 | 0.308 ms | 6484.66 | 21.194 ms |
+| dbuf | 6373.72 | 0.337 ms | 8079.08 | 17.012 ms |
+| cuBLAS | 10230.01 | 0.210 ms | 13875.37 | 9.905 ms |
 
-同一次运行的加速比（相对 naive，1024³）：coalesced 4.6×、smem 6.0×、1dblock 15.9×、
-2dblock 21.4×、vectorized 30.3×、nobank **31.9×**、warp 26.2×。4096³ 依次为 3.5× / 4.7× /
-15.2× / 23.2× / 29.2× / 30.5× / 20.9×。4096³ 下 nobank 已达到 cuBLAS 的 67%。
-数值为最近一次运行的实测，笔记本环境受功耗墙影响有波动，看同一次运行的比值更有意义。
+同一次运行的加速比（相对 naive，1024³）：coalesced 4.5×、smem 5.9×、1dblock 15.9×、
+2dblock 21.3×、vectorized 30.2×、nobank **31.5×**、warp 26.0×、dbuf 23.8×。
+4096³ 依次为 3.4× / 4.7× / 15.0× / 23.3× / 28.9× / 29.0× / 21.2× / 26.4×。
+4096³ 下 nobank 已达到 cuBLAS 的 64%。
 4096³ 时 CPU 对拍会自动跳过（`main.cu` 中 M×N×K > 2^30 即跳过，CPU 三重循环太慢），只保留 cuBLAS 对拍。
 
 ncu 数据（1024³）：naive 的瓶颈是 L1/TEX 被 32 个碎片请求/warp 打满（DRAM 仅 5.4%）；
@@ -87,8 +88,16 @@ warp tiling（教程 kernel 10 的 A6000 配置：128 线程、128 个寄存器�
 4070 Laptop 上**慢于 vectorized**：occupancy 只有 16.7%（寄存器限制 2 blocks/SM），
 8 warps/SM 遮不住访存延迟，所有吞吐指标都 <50%（Compute 40.5%）——A6000 的
 「重 ILP 轻 occupancy」配置在我们这块 46 SM 的笔记本芯片上水土不服。
-这正是下一步 autotuning 要解决的问题：warp tiling 的收益高度依赖
-(THREADS, WM, WN, TM, TN) 参数与具体硬件的匹配。
+double buffering（cp.async 双 barrier，教程 kernel 12 模式，BK=16）在
+vectorized 底座上的重叠收益**随 DRAM 延迟增大而显现**：1024³ 同轮比
+vectorized 慢 21%（L2 命中高、延迟短，重叠的净收益小），4096³ 只慢 9%
+（8079 vs 8853——DRAM 延迟长，预取遮住了更多等待）。4B cp.async 的
+指令开销、barrier 相位管理、双倍 smem 都是实打实的成本，教程的大幅
+收益来自 warptiling 组合底座 + A6000 的硬件特性。
+至此所有「教程主线」的优化手法都已实现并实测：真正的问题是——
+**每种手法与硬件的匹配度不同**，这正是下一步 autotuning 要解决的：
+扫参数（THREADS/BK/TM/TN/底座组合/流水级数），在 4070 Laptop 上找出
+真正的最优配置。
 
 ## 参考
 
