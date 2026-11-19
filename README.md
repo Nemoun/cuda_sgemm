@@ -50,54 +50,59 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 - [x] 6. 消除 bank conflict + smem 读向量化 —— 31× naive，收益有限（见性能记录）（`kernels/6_bank_conflict.cuh`）
 - [x] 7. warp tiling —— 26× naive，A6000 配置在 4070 Laptop 上慢于 vectorized（见性能记录）（`kernels/7_warptiling.cuh`）
 - [x] 8. double buffering（cp.async）—— 23.8× / 26.4× naive，重叠收益随 DRAM 延迟增大而显现（见性能记录）（`kernels/8_double_buffering.cuh`）
-- [ ] 9. autotuning（扫 warp tiling 参数）+ roofline 图
-- [ ] 10. Tensor Core（wmma）
+- [x] 9. autotuning（运行时扫 (BM,BN,BK,TM,TN)）—— 32.8× / 36.4× naive，4096³ 达 cuBLAS 的 80%（`kernels/9_autotuned.cuh`）
+- [ ] 10. roofline 图 + 性能曲线绘图（bench.py）
+- [ ] 11. Tensor Core（wmma）
 
 ## 性能记录
 
 | kernel | 1024³ GFLOPS | 1024³ 耗时 | 4096³ GFLOPS | 4096³ 耗时 |
 |---|---|---|---|---|
-| naive | 268.04 | 8.012 ms | 306.19 | 448.868 ms |
-| coalesced | 1217.86 | 1.763 ms | 1041.43 | 131.971 ms |
-| smem | 1594.07 | 1.347 ms | 1433.75 | 95.860 ms |
-| 1dblock | 4271.19 | 0.503 ms | 4603.43 | 29.856 ms |
-| 2dblock | 5698.78 | 0.377 ms | 7137.34 | 19.256 ms |
-| vectorized | 8104.94 | 0.265 ms | 8853.41 | 15.524 ms |
-| nobank | 8435.00 | 0.255 ms | 8888.00 | 15.463 ms |
-| warp | 6969.45 | 0.308 ms | 6484.66 | 21.194 ms |
-| dbuf | 6373.72 | 0.337 ms | 8079.08 | 17.012 ms |
-| cuBLAS | 10230.01 | 0.210 ms | 13875.37 | 9.905 ms |
+| naive | 269.21 | 7.977 ms | 305.79 | 449.452 ms |
+| coalesced | 1220.87 | 1.759 ms | 1048.86 | 131.037 ms |
+| smem | 1595.21 | 1.346 ms | 1443.80 | 95.193 ms |
+| 1dblock | 4271.19 | 0.503 ms | 4684.41 | 29.340 ms |
+| 2dblock | 5729.43 | 0.375 ms | 7406.00 | 18.558 ms |
+| vectorized | 8004.40 | 0.268 ms | 8824.92 | 15.574 ms |
+| nobank | 8388.61 | 0.256 ms | 9243.01 | 14.870 ms |
+| warp | 6990.51 | 0.307 ms | 6100.00 | 22.531 ms |
+| dbuf | 6413.31 | 0.335 ms | 8057.74 | 17.057 ms |
+| autotuned | 8821.99 | 0.243 ms | 11125.48 | 12.354 ms |
+| cuBLAS | 10180.35 | 0.211 ms | 13856.88 | 9.918 ms |
 
-同一次运行的加速比（相对 naive，1024³）：coalesced 4.5×、smem 5.9×、1dblock 15.9×、
-2dblock 21.3×、vectorized 30.2×、nobank **31.5×**、warp 26.0×、dbuf 23.8×。
-4096³ 依次为 3.4× / 4.7× / 15.0× / 23.3× / 28.9× / 29.0× / 21.2× / 26.4×。
-4096³ 下 nobank 已达到 cuBLAS 的 64%。
-4096³ 时 CPU 对拍会自动跳过（`main.cu` 中 M×N×K > 2^30 即跳过，CPU 三重循环太慢），只保留 cuBLAS 对拍。
+### 加速比速览（同一次运行，相对 naive）
 
-ncu 数据（1024³）：naive 的瓶颈是 L1/TEX 被 32 个碎片请求/warp 打满（DRAM 仅 5.4%）；
-合并访问后瓶颈转移到 Compute(SM) 98.3%——每 FMA 配 2 条 load；
-smem 版把 load 搬进 shared memory，但 2:1 的 load:FMA 没变，瓶颈仍在访存发射；
-1dblock 用 TM=8 个寄存器累加器把 load:FMA 压到约 1:1（Compute 72.5%）；
-2dblock 用 TM×TN=64 个累加器压到 1:4（Compute 43.6%，L1/TEX 71% 成最忙部件）；
-vectorized 用 float4 把搬运次数 ÷4（As 转置 scatter、Bs/C 直存），L1/TEX 降到 64.7%；
-nobank 用 swizzle 布局（Bs4 按 float4 单位重排）+ 内积 LDS.128，实测**读冲突 0**，
-但 Bs4 的散列存储带来 52 万次**存储冲突**，整体收益有限且不稳定
-（1024³ +13%、4096³ −1.7%，ncu 下对比还会翻转）——与教程作者在 A6000 上的
-经验一致，这也是文章跳过 bank conflict 章节直接讲 autotuning 的原因。
-warp tiling（教程 kernel 10 的 A6000 配置：128 线程、128 个寄存器累加器）在
-4070 Laptop 上**慢于 vectorized**：occupancy 只有 16.7%（寄存器限制 2 blocks/SM），
-8 warps/SM 遮不住访存延迟，所有吞吐指标都 <50%（Compute 40.5%）——A6000 的
-「重 ILP 轻 occupancy」配置在我们这块 46 SM 的笔记本芯片上水土不服。
-double buffering（cp.async 双 barrier，教程 kernel 12 模式，BK=16）在
-vectorized 底座上的重叠收益**随 DRAM 延迟增大而显现**：1024³ 同轮比
-vectorized 慢 21%（L2 命中高、延迟短，重叠的净收益小），4096³ 只慢 9%
-（8079 vs 8853——DRAM 延迟长，预取遮住了更多等待）。4B cp.async 的
-指令开销、barrier 相位管理、双倍 smem 都是实打实的成本，教程的大幅
-收益来自 warptiling 组合底座 + A6000 的硬件特性。
-至此所有「教程主线」的优化手法都已实现并实测：真正的问题是——
-**每种手法与硬件的匹配度不同**，这正是下一步 autotuning 要解决的：
-扫参数（THREADS/BK/TM/TN/底座组合/流水级数），在 4070 Laptop 上找出
-真正的最优配置。
+- 1024³：coalesced 4.5× → smem 5.9× → 1dblock 15.9× → 2dblock 21.3× → vectorized 29.7× → nobank 31.2× → **autotuned 32.8×**
+- 4096³：coalesced 3.4× → smem 4.7× → 1dblock 15.3× → 2dblock 24.2× → vectorized 28.9× → nobank 30.2× → **autotuned 36.4×**
+- 4096³ 下 autotuned 达到 cuBLAS 的 **80%**
+- 说明：数值为最近一次运行的实测，有 ±5% 波动，看同一次运行的比值更有意义；4096³ 时 CPU 对拍自动跳过（`main.cu` 中 M×N×K > 2^30，CPU 三重循环太慢），只保留 cuBLAS 对拍
+
+### 优化历程与 ncu 诊断（1024³）
+
+1. **naive**：L1/TEX 被 32 个碎片请求/warp 打满（DRAM 仅 5.4%）
+2. **coalesced**：请求合并后，瓶颈转移到 Compute(SM) 98.3%——每 FMA 配 2 条 load
+3. **smem**：load 搬进 shared memory，但 2:1 的 load:FMA 没变，瓶颈仍在访存发射
+4. **1dblock**：TM=8 个寄存器累加器把 load:FMA 压到约 1:1（Compute 72.5%）
+5. **2dblock**：TM×TN=64 个累加器压到 1:4（Compute 43.6%，L1/TEX 71% 成最忙部件）
+6. **vectorized**：float4 把搬运次数 ÷4，L1/TEX 降到 64.7%
+7. **nobank**：swizzle 布局 + 内积 LDS.128，实测读冲突 0，但 Bs4 散列存储带来 52 万次存储冲突——整体收益有限且不稳定（1024³ +13%、4096³ −1.7%）。与教程作者在 A6000 上的经验一致，这也是文章跳过 bank conflict 章节直接讲 autotuning 的原因
+8. **warp tiling**：教程 A6000 配置（128 线程、128 累加器）在 4070 Laptop 上慢于 vectorized——occupancy 仅 16.7%，8 warps/SM 遮不住访存延迟，「重 ILP 轻 occupancy」水土不服
+9. **double buffering**：cp.async 双 barrier（BK=16）的重叠收益随 DRAM 延迟增大而显现——1024³ 慢 21%（L2 命中高、重叠净收益小），4096³ 只慢 9%
+
+### autotuning 扫描发现（11 个配置）
+
+- **最优配置随尺寸变化**：1024³ 选 (128,128,16,8,8)，4096³ 选 (64,128,16,8,8)——若固定用 1024³ 的最优配置，4096³ 只能到 9830，比自适应少 13%
+- **BK=16 是甜点**（BK=8/32 都更差）；TM=4 与「64×64+BK=32」是坑
+- 同一个 kernel 只差 tile 尺寸，性能差近 2 倍（5935 → 11125）——warp tiling 里程碑「配置不匹配」问题的最终答案
+
+### 总结与后续
+
+最优配置是 (BM,BN,BK,TM,TN) 与尺寸、硬件的联合函数，运行时扫描比手工挑参数可靠。后续可选方向：
+
+- swizzle / dbuf 变体的第二期扫描
+- 多级流水（3~4 buffer）
+- Tensor Core（wmma）
+- roofline 图收尾（bench.py 绘图）
 
 ## 参考
 
