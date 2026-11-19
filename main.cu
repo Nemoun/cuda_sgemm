@@ -17,6 +17,7 @@
 #include "kernels/3_1d_blocktiling.cuh"
 #include "kernels/4_2d_blocktiling.cuh"
 #include "kernels/5_vectorize.cuh"
+#include "kernels/6_bank_conflict.cuh"
 
 // CUDA API 错误检查
 #define CHECK(call)                                                            \
@@ -152,9 +153,10 @@ int main(int argc, char **argv) {
   float *h_c4 = (float *)malloc(bytes_c);
   float *h_c5 = (float *)malloc(bytes_c);
   float *h_c6 = (float *)malloc(bytes_c);
+  float *h_c7 = (float *)malloc(bytes_c);
   float *h_ref = (float *)malloc(bytes_c);
   float *h_cblas = (float *)malloc(bytes_c);
-  if (!h_a || !h_b || !h_c || !h_c2 || !h_c3 || !h_c4 || !h_c5 || !h_c6 || !h_ref || !h_cblas) {
+  if (!h_a || !h_b || !h_c || !h_c2 || !h_c3 || !h_c4 || !h_c5 || !h_c6 || !h_c7 || !h_ref || !h_cblas) {
     fprintf(stderr, "host malloc failed\n");
     return EXIT_FAILURE;
   }
@@ -234,6 +236,17 @@ int main(int argc, char **argv) {
          gflops_vec, gflops_vec / gflops);
   CHECK(cudaMemcpy(h_c6, d_c, bytes_c, cudaMemcpyDeviceToHost));
 
+  // ---- 1g. kernel 6：消除 bank conflict + smem 读向量化 ----
+  launch_sgemm_no_bank_conflict(d_a, d_b, d_c, M, N, K);  // 预热，同时暴露启动配置错误
+  CHECK(cudaGetLastError());
+  CHECK(cudaDeviceSynchronize());
+  float ms_nobank =
+      time_ms([&] { launch_sgemm_no_bank_conflict(d_a, d_b, d_c, M, N, K); }, 3);
+  double gflops_nobank = 2.0 * M * N * K / (ms_nobank * 1e6);
+  printf("nobank:   %9.3f ms  %10.2f GFLOPS  (%.2fx naive)\n", ms_nobank,
+         gflops_nobank, gflops_nobank / gflops);
+  CHECK(cudaMemcpy(h_c7, d_c, bytes_c, cudaMemcpyDeviceToHost));
+
   // ---- 2. CPU 参考对拍（尺寸太大则跳过，避免 CPU 跑太久） ----
   if ((size_t)M * N * K <= (size_t)1 << 30) {
     sgemm_cpu(h_a, h_b, h_ref, M, N, K);
@@ -283,6 +296,14 @@ int main(int argc, char **argv) {
            bad_v == 0 ? "PASS" : "FAIL", rel_v);
     if (bad_v) {
       printf("  不一致的元素: %d\n", bad_v);
+      return EXIT_FAILURE;
+    }
+    float rel_w = 0.0f;
+    int bad_w = check_against(h_c7, h_ref, M * N, &rel_w);
+    printf("CPU 对拍 (nobank): %s (max rel err = %.2e)\n",
+           bad_w == 0 ? "PASS" : "FAIL", rel_w);
+    if (bad_w) {
+      printf("  不一致的元素: %d\n", bad_w);
       return EXIT_FAILURE;
     }
   } else {
@@ -358,9 +379,17 @@ int main(int argc, char **argv) {
     printf("  不一致的元素: %d\n", bad7);
     return EXIT_FAILURE;
   }
+  float rel8 = 0.0f;
+  int bad8 = check_against(h_c7, h_cblas, M * N, &rel8);
+  printf("cuBLAS 对拍 (nobank): %s (max rel err = %.2e)\n",
+         bad8 == 0 ? "PASS" : "FAIL", rel8);
+  if (bad8) {
+    printf("  不一致的元素: %d\n", bad8);
+    return EXIT_FAILURE;
+  }
 
-  // ---- 5. 可选 dump（h_c6 是当前最新 kernel 的结果，供 bench.py 对拍） ----
-  if (dump_path) dump(dump_path, h_c6, M, N, K);
+  // ---- 5. 可选 dump（h_c7 是当前最新 kernel 的结果，供 bench.py 对拍） ----
+  if (dump_path) dump(dump_path, h_c7, M, N, K);
 
   CHECK_CUBLAS(cublasDestroy(handle));
   CHECK(cudaFree(d_a));
@@ -374,6 +403,7 @@ int main(int argc, char **argv) {
   free(h_c4);
   free(h_c5);
   free(h_c6);
+  free(h_c7);
   free(h_ref);
   free(h_cblas);
   return EXIT_SUCCESS;

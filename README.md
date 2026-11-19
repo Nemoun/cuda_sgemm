@@ -47,27 +47,28 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 - [x] 3. 1D blocktiling（寄存器分块）—— 19× naive（`kernels/3_1d_blocktiling.cuh`）
 - [x] 4. 2D blocktiling（TM×TN 寄存器分块）—— 26.5× naive（`kernels/4_2d_blocktiling.cuh`）
 - [x] 5. float4 向量化搬运 —— 29.6× naive（`kernels/5_vectorize.cuh`）
-- [ ] 6. 消除 bank conflict + smem 读向量化
-- [ ] 6. warp tiling / double buffering
-- [ ] 7. Tensor Core（wmma）
-- [ ] 8. autotuning + roofline 图
+- [x] 6. 消除 bank conflict + smem 读向量化 —— 31× naive，收益有限（见性能记录）（`kernels/6_bank_conflict.cuh`）
+- [ ] 7. warp tiling / double buffering
+- [ ] 8. Tensor Core（wmma）
+- [ ] 9. autotuning + roofline 图
 
 ## 性能记录
 
 | kernel | 1024³ GFLOPS | 1024³ 耗时 | 4096³ GFLOPS | 4096³ 耗时 |
 |---|---|---|---|---|
-| naive | 269.43 | 7.971 ms | 303.30 | 453.146 ms |
-| coalesced | 1222.85 | 1.756 ms | 1067.80 | 128.712 ms |
-| smem | 1593.62 | 1.348 ms | 1436.19 | 95.697 ms |
-| 1dblock | 4144.57 | 0.518 ms | 4361.97 | 31.508 ms |
-| 2dblock | 5777.28 | 0.372 ms | 7063.72 | 19.457 ms |
-| vectorized | 7973.96 | 0.269 ms | 8447.74 | 16.269 ms |
-| cuBLAS | 9939.11 | 0.216 ms | 13780.05 | 9.974 ms |
+| naive | 269.66 | 7.964 ms | 303.18 | 453.323 ms |
+| coalesced | 1222.34 | 1.757 ms | 1063.34 | 129.252 ms |
+| smem | 1592.37 | 1.349 ms | 1459.06 | 94.197 ms |
+| 1dblock | 4253.86 | 0.505 ms | 4454.20 | 30.856 ms |
+| 2dblock | 5583.56 | 0.385 ms | 7220.67 | 19.034 ms |
+| vectorized | 7389.22 | 0.291 ms | 9118.67 | 15.072 ms |
+| nobank | 8355.19 | 0.257 ms | 8966.51 | 15.328 ms |
+| cuBLAS | 10228.45 | 0.210 ms | 13341.72 | 10.301 ms |
 
-同一次运行的加速比（相对 naive，1024³）：coalesced 4.5×、smem 5.9×、1dblock 15.4×、
-2dblock 21.4×、vectorized **29.6×**。4096³ 依次为 3.5× / 4.7× / 14.4× / 23.3× / 27.9×。
-4096³ 下 vectorized 已达到 cuBLAS 的 61%。数值为最近一次运行的实测，
-笔记本环境受功耗墙影响有波动，看同一次运行的比值更有意义。
+同一次运行的加速比（相对 naive，1024³）：coalesced 4.5×、smem 5.9×、1dblock 15.8×、
+2dblock 20.7×、vectorized 27.4×、nobank **31.0×**。4096³ 依次为 3.5× / 4.8× / 14.7× /
+23.8× / 30.1× / 29.6×。4096³ 下 vectorized 已达到 cuBLAS 的 68%。
+数值为最近一次运行的实测，笔记本环境受功耗墙影响有波动，看同一次运行的比值更有意义。
 4096³ 时 CPU 对拍会自动跳过（`main.cu` 中 M×N×K > 2^30 即跳过，CPU 三重循环太慢），只保留 cuBLAS 对拍。
 
 ncu 数据（1024³）：naive 的瓶颈是 L1/TEX 被 32 个碎片请求/warp 打满（DRAM 仅 5.4%）；
@@ -75,10 +76,12 @@ ncu 数据（1024³）：naive 的瓶颈是 L1/TEX 被 32 个碎片请求/warp �
 smem 版把 load 搬进 shared memory，但 2:1 的 load:FMA 没变，瓶颈仍在访存发射；
 1dblock 用 TM=8 个寄存器累加器把 load:FMA 压到约 1:1（Compute 72.5%）；
 2dblock 用 TM×TN=64 个累加器压到 1:4（Compute 43.6%，L1/TEX 71% 成最忙部件）；
-vectorized 用 float4 把搬运次数 ÷4（As 转置 scatter、Bs/C 直存），
-L1/TEX 降到 64.7%、GFLOPS 再涨 38%、Compute 升到 50.1%、DRAM 20.7%；
-occupancy 仍 33%（寄存器限制）。剩余大头：内积的标量 smem 读（含 Bs 行的
-4-way bank conflict）——下一个里程碑：消除 bank conflict + smem 读向量化。
+vectorized 用 float4 把搬运次数 ÷4（As 转置 scatter、Bs/C 直存），L1/TEX 降到 64.7%；
+nobank 用 swizzle 布局（Bs4 按 float4 单位重排）+ 内积 LDS.128，实测**读冲突 0**，
+但 Bs4 的散列存储带来 52 万次**存储冲突**，整体收益有限且不稳定
+（1024³ +13%、4096³ −1.7%，ncu 下对比还会翻转）——与教程作者在 A6000 上的
+经验一致，这也是文章跳过 bank conflict 章节直接讲 autotuning 的原因。
+下一步：warp tiling / double buffering（教程 kernel 10/11，通常是真正的收益点）。
 
 ## 参考
 
