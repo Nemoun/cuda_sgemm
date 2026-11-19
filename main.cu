@@ -1,7 +1,9 @@
 // ============================================================
 // CUDA SGEMM benchmark 入口
 // 职责：分配矩阵 → 启动 kernel（计时）→ CPU/cuBLAS 对拍 → 输出 GFLOPS
-// 用法：./sgemm [M [N [K]]] [--dump out.bin]
+// 用法：./sgemm [M [N [K]]] [--kernel <名字|all>] [--dump out.bin]
+//   --kernel naive | coalesced | smem | 1dblock | 2dblock | vectorized
+//            | nobank | warp | dbuf | auto    （默认 all，全部按顺序跑）
 // ============================================================
 #include <cmath>
 #include <cstdio>
@@ -117,14 +119,26 @@ void dump(const char *path, const float *c, int M, int N, int K) {
   printf("已写入 kernel 结果: %s\n", path);
 }
 
+// ---------------- kernel 注册表 ----------------
+struct KernelEntry {
+  const char *name;   // --kernel 参数名
+  const char *label;  // 输出标签
+  float *h_out;       // 结果 buffer
+  bool ran = false;   // 本轮是否运行
+  float ms = 0.0f;    // 最快耗时
+};
+
 int main(int argc, char **argv) {
-  // ---- 参数解析：./sgemm [M [N [K]]] [--dump out.bin] ----
+  // ---- 参数解析：./sgemm [M [N [K]]] [--kernel name] [--dump out.bin] ----
   int M = 1024, N = 1024, K = 1024;
+  const char *kernel_sel = "all";
   const char *dump_path = nullptr;
   int pos = 0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) {
       dump_path = argv[++i];
+    } else if (strcmp(argv[i], "--kernel") == 0 && i + 1 < argc) {
+      kernel_sel = argv[++i];
     } else if (argv[i][0] >= '0' && argv[i][0] <= '9') {
       if (pos == 0) M = atoi(argv[i]);
       else if (pos == 1) N = atoi(argv[i]);
@@ -150,19 +164,13 @@ int main(int argc, char **argv) {
   size_t bytes_c = (size_t)M * N * sizeof(float);
   float *h_a = (float *)malloc(bytes_a);
   float *h_b = (float *)malloc(bytes_b);
-  float *h_c = (float *)malloc(bytes_c);
-  float *h_c2 = (float *)malloc(bytes_c);
-  float *h_c3 = (float *)malloc(bytes_c);
-  float *h_c4 = (float *)malloc(bytes_c);
-  float *h_c5 = (float *)malloc(bytes_c);
-  float *h_c6 = (float *)malloc(bytes_c);
-  float *h_c7 = (float *)malloc(bytes_c);
-  float *h_c8 = (float *)malloc(bytes_c);
-  float *h_c9 = (float *)malloc(bytes_c);
-  float *h_c10 = (float *)malloc(bytes_c);
+  float *h_bufs[10];  // 每个 kernel 一个结果 buffer
+  for (int i = 0; i < 10; i++) h_bufs[i] = (float *)malloc(bytes_c);
   float *h_ref = (float *)malloc(bytes_c);
   float *h_cblas = (float *)malloc(bytes_c);
-  if (!h_a || !h_b || !h_c || !h_c2 || !h_c3 || !h_c4 || !h_c5 || !h_c6 || !h_c7 || !h_c8 || !h_c9 || !h_c10 || !h_ref || !h_cblas) {
+  bool alloc_ok = h_a && h_b && h_ref && h_cblas;
+  for (int i = 0; i < 10; i++) alloc_ok = alloc_ok && h_bufs[i];
+  if (!alloc_ok) {
     fprintf(stderr, "host malloc failed\n");
     return EXIT_FAILURE;
   }
@@ -176,200 +184,138 @@ int main(int argc, char **argv) {
   CHECK(cudaMemcpy(d_a, h_a, bytes_a, cudaMemcpyHostToDevice));
   CHECK(cudaMemcpy(d_b, h_b, bytes_b, cudaMemcpyHostToDevice));
 
-  // ---- 1. 你的 kernel：预热 + 计时 ----
-  launch_sgemm_naive(d_a, d_b, d_c, M, N, K);  // 预热，同时暴露启动配置错误
-  CHECK(cudaGetLastError());
-  CHECK(cudaDeviceSynchronize());
-  float ms = time_ms([&] { launch_sgemm_naive(d_a, d_b, d_c, M, N, K); }, 3);
-  double gflops = 2.0 * M * N * K / (ms * 1e6);
-  printf("naive:  %10.3f ms  %10.2f GFLOPS\n", ms, gflops);
+  // ---- kernel 注册表（顺序即默认执行顺序） ----
+  KernelEntry entries[] = {
+      {"naive", "naive:", h_bufs[0]},
+      {"coalesced", "coalesced:", h_bufs[1]},
+      {"smem", "smem:", h_bufs[2]},
+      {"1dblock", "1dblock:", h_bufs[3]},
+      {"2dblock", "2dblock:", h_bufs[4]},
+      {"vectorized", "vectorized:", h_bufs[5]},
+      {"nobank", "nobank:", h_bufs[6]},
+      {"warp", "warp:", h_bufs[7]},
+      {"dbuf", "dbuf:", h_bufs[8]},
+      {"auto", "auto:", h_bufs[9]},
+  };
+  const int n_entries = (int)(sizeof(entries) / sizeof(entries[0]));
 
-  // 注意：先把 kernel 结果拷回 host，后面 cuBLAS 会覆盖 d_c
-  CHECK(cudaMemcpy(h_c, d_c, bytes_c, cudaMemcpyDeviceToHost));
+  // ---- 运行某个 kernel：预热 + 计时，结果拷回 host ----
+  auto run_entry = [&](KernelEntry &e) {
+    if (strcmp(e.name, "naive") == 0) {
+      launch_sgemm_naive(d_a, d_b, d_c, M, N, K);  // 预热，同时暴露启动配置错误
+      CHECK(cudaGetLastError());
+      CHECK(cudaDeviceSynchronize());
+      e.ms = time_ms([&] { launch_sgemm_naive(d_a, d_b, d_c, M, N, K); }, 3);
+    } else if (strcmp(e.name, "coalesced") == 0) {
+      launch_sgemm_global_memory(d_a, d_b, d_c, M, N, K);
+      CHECK(cudaGetLastError());
+      CHECK(cudaDeviceSynchronize());
+      e.ms = time_ms([&] { launch_sgemm_global_memory(d_a, d_b, d_c, M, N, K); }, 3);
+    } else if (strcmp(e.name, "smem") == 0) {
+      launch_sgemm_shared_memory(d_a, d_b, d_c, M, N, K);
+      CHECK(cudaGetLastError());
+      CHECK(cudaDeviceSynchronize());
+      e.ms = time_ms([&] { launch_sgemm_shared_memory(d_a, d_b, d_c, M, N, K); }, 3);
+    } else if (strcmp(e.name, "1dblock") == 0) {
+      launch_sgemm_1d_blocktiling(d_a, d_b, d_c, M, N, K);
+      CHECK(cudaGetLastError());
+      CHECK(cudaDeviceSynchronize());
+      e.ms = time_ms([&] { launch_sgemm_1d_blocktiling(d_a, d_b, d_c, M, N, K); }, 3);
+    } else if (strcmp(e.name, "2dblock") == 0) {
+      launch_sgemm_2d_blocktiling(d_a, d_b, d_c, M, N, K);
+      CHECK(cudaGetLastError());
+      CHECK(cudaDeviceSynchronize());
+      e.ms = time_ms([&] { launch_sgemm_2d_blocktiling(d_a, d_b, d_c, M, N, K); }, 3);
+    } else if (strcmp(e.name, "vectorized") == 0) {
+      launch_sgemm_vectorize(d_a, d_b, d_c, M, N, K);
+      CHECK(cudaGetLastError());
+      CHECK(cudaDeviceSynchronize());
+      e.ms = time_ms([&] { launch_sgemm_vectorize(d_a, d_b, d_c, M, N, K); }, 3);
+    } else if (strcmp(e.name, "nobank") == 0) {
+      launch_sgemm_no_bank_conflict(d_a, d_b, d_c, M, N, K);
+      CHECK(cudaGetLastError());
+      CHECK(cudaDeviceSynchronize());
+      e.ms = time_ms([&] { launch_sgemm_no_bank_conflict(d_a, d_b, d_c, M, N, K); }, 3);
+    } else if (strcmp(e.name, "warp") == 0) {
+      launch_sgemm_warptiling(d_a, d_b, d_c, M, N, K);
+      CHECK(cudaGetLastError());
+      CHECK(cudaDeviceSynchronize());
+      e.ms = time_ms([&] { launch_sgemm_warptiling(d_a, d_b, d_c, M, N, K); }, 3);
+    } else if (strcmp(e.name, "dbuf") == 0) {
+      launch_sgemm_double_buffering(d_a, d_b, d_c, M, N, K);
+      CHECK(cudaGetLastError());
+      CHECK(cudaDeviceSynchronize());
+      e.ms = time_ms([&] { launch_sgemm_double_buffering(d_a, d_b, d_c, M, N, K); }, 3);
+    } else if (strcmp(e.name, "auto") == 0) {
+      // 内部完成配置扫描 + 最优重跑（结果已留在 d_c）
+      e.ms = launch_sgemm_autotuned(d_a, d_b, d_c, M, N, K);
+    } else {
+      fprintf(stderr, "未知 kernel: %s\n", e.name);
+      exit(EXIT_FAILURE);
+    }
+    CHECK(cudaMemcpy(e.h_out, d_c, bytes_c, cudaMemcpyDeviceToHost));
+    e.ran = true;
+  };
 
-  // ---- 1b. kernel 1：global memory 合并访问 ----
-  launch_sgemm_global_memory(d_a, d_b, d_c, M, N, K);  // 预热，同时暴露启动配置错误
-  CHECK(cudaGetLastError());
-  CHECK(cudaDeviceSynchronize());
-  float ms_coalesced =
-      time_ms([&] { launch_sgemm_global_memory(d_a, d_b, d_c, M, N, K); }, 3);
-  double gflops_coalesced = 2.0 * M * N * K / (ms_coalesced * 1e6);
-  printf("coalesced: %9.3f ms  %10.2f GFLOPS  (%.2fx naive)\n", ms_coalesced,
-         gflops_coalesced, gflops_coalesced / gflops);
-  CHECK(cudaMemcpy(h_c2, d_c, bytes_c, cudaMemcpyDeviceToHost));
+  // ---- 执行所选 kernel ----
+  if (strcmp(kernel_sel, "all") == 0) {
+    for (int i = 0; i < n_entries; i++) run_entry(entries[i]);
+  } else {
+    bool found = false;
+    for (int i = 0; i < n_entries; i++)
+      if (strcmp(entries[i].name, kernel_sel) == 0) {
+        run_entry(entries[i]);
+        found = true;
+        break;
+      }
+    if (!found) {
+      fprintf(stderr, "未知 kernel: %s\n", kernel_sel);
+      return EXIT_FAILURE;
+    }
+  }
 
-  // ---- 1c. kernel 2：shared memory tiling ----
-  launch_sgemm_shared_memory(d_a, d_b, d_c, M, N, K);  // 预热，同时暴露启动配置错误
-  CHECK(cudaGetLastError());
-  CHECK(cudaDeviceSynchronize());
-  float ms_smem =
-      time_ms([&] { launch_sgemm_shared_memory(d_a, d_b, d_c, M, N, K); }, 3);
-  double gflops_smem = 2.0 * M * N * K / (ms_smem * 1e6);
-  printf("smem:     %9.3f ms  %10.2f GFLOPS  (%.2fx naive)\n", ms_smem,
-         gflops_smem, gflops_smem / gflops);
-  CHECK(cudaMemcpy(h_c3, d_c, bytes_c, cudaMemcpyDeviceToHost));
+  // ---- 打印结果（比值以 naive 为基准，若本轮没跑 naive 则不打印比值） ----
+  const double flops = 2.0 * (double)M * N * K;
+  double naive_gf = 0.0;
+  bool naive_ran = false;
+  float *last_out = nullptr;
+  for (int i = 0; i < n_entries; i++) {
+    KernelEntry &e = entries[i];
+    if (!e.ran) continue;
+    double gf = flops / (e.ms * 1e6);
+    last_out = e.h_out;
+    if (strcmp(e.name, "naive") == 0) {
+      naive_gf = gf;
+      naive_ran = true;
+      printf("%-10s %9.3f ms  %10.2f GFLOPS\n", e.label, e.ms, gf);
+    } else if (naive_ran) {
+      printf("%-10s %9.3f ms  %10.2f GFLOPS  (%.2fx naive)\n", e.label, e.ms,
+             gf, gf / naive_gf);
+    } else {
+      printf("%-10s %9.3f ms  %10.2f GFLOPS\n", e.label, e.ms, gf);
+    }
+  }
 
-  // ---- 1d. kernel 3：1D blocktiling（寄存器分块） ----
-  launch_sgemm_1d_blocktiling(d_a, d_b, d_c, M, N, K);  // 预热，同时暴露启动配置错误
-  CHECK(cudaGetLastError());
-  CHECK(cudaDeviceSynchronize());
-  float ms_1d =
-      time_ms([&] { launch_sgemm_1d_blocktiling(d_a, d_b, d_c, M, N, K); }, 3);
-  double gflops_1d = 2.0 * M * N * K / (ms_1d * 1e6);
-  printf("1dblock:  %9.3f ms  %10.2f GFLOPS  (%.2fx naive)\n", ms_1d,
-         gflops_1d, gflops_1d / gflops);
-  CHECK(cudaMemcpy(h_c4, d_c, bytes_c, cudaMemcpyDeviceToHost));
-
-  // ---- 1e. kernel 4：2D blocktiling（TM×TN 寄存器分块） ----
-  launch_sgemm_2d_blocktiling(d_a, d_b, d_c, M, N, K);  // 预热，同时暴露启动配置错误
-  CHECK(cudaGetLastError());
-  CHECK(cudaDeviceSynchronize());
-  float ms_2d =
-      time_ms([&] { launch_sgemm_2d_blocktiling(d_a, d_b, d_c, M, N, K); }, 3);
-  double gflops_2d = 2.0 * M * N * K / (ms_2d * 1e6);
-  printf("2dblock:  %9.3f ms  %10.2f GFLOPS  (%.2fx naive)\n", ms_2d,
-         gflops_2d, gflops_2d / gflops);
-  CHECK(cudaMemcpy(h_c5, d_c, bytes_c, cudaMemcpyDeviceToHost));
-
-  // ---- 1f. kernel 5：float4 向量化搬运 ----
-  launch_sgemm_vectorize(d_a, d_b, d_c, M, N, K);  // 预热，同时暴露启动配置错误
-  CHECK(cudaGetLastError());
-  CHECK(cudaDeviceSynchronize());
-  float ms_vec =
-      time_ms([&] { launch_sgemm_vectorize(d_a, d_b, d_c, M, N, K); }, 3);
-  double gflops_vec = 2.0 * M * N * K / (ms_vec * 1e6);
-  printf("vectorized:%9.3f ms  %10.2f GFLOPS  (%.2fx naive)\n", ms_vec,
-         gflops_vec, gflops_vec / gflops);
-  CHECK(cudaMemcpy(h_c6, d_c, bytes_c, cudaMemcpyDeviceToHost));
-
-  // ---- 1g. kernel 6：消除 bank conflict + smem 读向量化 ----
-  launch_sgemm_no_bank_conflict(d_a, d_b, d_c, M, N, K);  // 预热，同时暴露启动配置错误
-  CHECK(cudaGetLastError());
-  CHECK(cudaDeviceSynchronize());
-  float ms_nobank =
-      time_ms([&] { launch_sgemm_no_bank_conflict(d_a, d_b, d_c, M, N, K); }, 3);
-  double gflops_nobank = 2.0 * M * N * K / (ms_nobank * 1e6);
-  printf("nobank:   %9.3f ms  %10.2f GFLOPS  (%.2fx naive)\n", ms_nobank,
-         gflops_nobank, gflops_nobank / gflops);
-  CHECK(cudaMemcpy(h_c7, d_c, bytes_c, cudaMemcpyDeviceToHost));
-
-  // ---- 1h. kernel 7：warp tiling ----
-  launch_sgemm_warptiling(d_a, d_b, d_c, M, N, K);  // 预热，同时暴露启动配置错误
-  CHECK(cudaGetLastError());
-  CHECK(cudaDeviceSynchronize());
-  float ms_warp =
-      time_ms([&] { launch_sgemm_warptiling(d_a, d_b, d_c, M, N, K); }, 3);
-  double gflops_warp = 2.0 * M * N * K / (ms_warp * 1e6);
-  printf("warp:     %9.3f ms  %10.2f GFLOPS  (%.2fx naive)\n", ms_warp,
-         gflops_warp, gflops_warp / gflops);
-  CHECK(cudaMemcpy(h_c8, d_c, bytes_c, cudaMemcpyDeviceToHost));
-
-  // ---- 1i. kernel 8：double buffering（cp.async） ----
-  launch_sgemm_double_buffering(d_a, d_b, d_c, M, N, K);  // 预热，同时暴露启动配置错误
-  CHECK(cudaGetLastError());
-  CHECK(cudaDeviceSynchronize());
-  float ms_dbuf =
-      time_ms([&] { launch_sgemm_double_buffering(d_a, d_b, d_c, M, N, K); }, 3);
-  double gflops_dbuf = 2.0 * M * N * K / (ms_dbuf * 1e6);
-  printf("dbuf:     %9.3f ms  %10.2f GFLOPS  (%.2fx naive)\n", ms_dbuf,
-         gflops_dbuf, gflops_dbuf / gflops);
-  CHECK(cudaMemcpy(h_c9, d_c, bytes_c, cudaMemcpyDeviceToHost));
-
-  // ---- 1j. kernel 9：autotuned（运行时扫配置表，函数内完成扫描 + 最优重跑） ----
-  float ms_auto = launch_sgemm_autotuned(d_a, d_b, d_c, M, N, K);
-  double gflops_auto = 2.0 * M * N * K / (ms_auto * 1e6);
-  printf("auto:     %9.3f ms  %10.2f GFLOPS  (%.2fx naive)\n", ms_auto,
-         gflops_auto, gflops_auto / gflops);
-  CHECK(cudaMemcpy(h_c10, d_c, bytes_c, cudaMemcpyDeviceToHost));
-
-  // ---- 2. CPU 参考对拍（尺寸太大则跳过，避免 CPU 跑太久） ----
+  // ---- CPU 参考对拍（只查本轮跑过的 kernel；尺寸太大则跳过） ----
   if ((size_t)M * N * K <= (size_t)1 << 30) {
     sgemm_cpu(h_a, h_b, h_ref, M, N, K);
-    float rel = 0.0f;
-    int bad = check_against(h_c, h_ref, M * N, &rel);
-    printf("CPU 对拍 (naive): %s (max rel err = %.2e)\n",
-           bad == 0 ? "PASS" : "FAIL", rel);
-    if (bad) {
-      printf("  不一致的元素: %d\n", bad);
-      return EXIT_FAILURE;
-    }
-    float rel_c = 0.0f;
-    int bad_c = check_against(h_c2, h_ref, M * N, &rel_c);
-    printf("CPU 对拍 (coalesced): %s (max rel err = %.2e)\n",
-           bad_c == 0 ? "PASS" : "FAIL", rel_c);
-    if (bad_c) {
-      printf("  不一致的元素: %d\n", bad_c);
-      return EXIT_FAILURE;
-    }
-    float rel_s = 0.0f;
-    int bad_s = check_against(h_c3, h_ref, M * N, &rel_s);
-    printf("CPU 对拍 (smem): %s (max rel err = %.2e)\n",
-           bad_s == 0 ? "PASS" : "FAIL", rel_s);
-    if (bad_s) {
-      printf("  不一致的元素: %d\n", bad_s);
-      return EXIT_FAILURE;
-    }
-    float rel_t = 0.0f;
-    int bad_t = check_against(h_c4, h_ref, M * N, &rel_t);
-    printf("CPU 对拍 (1dblock): %s (max rel err = %.2e)\n",
-           bad_t == 0 ? "PASS" : "FAIL", rel_t);
-    if (bad_t) {
-      printf("  不一致的元素: %d\n", bad_t);
-      return EXIT_FAILURE;
-    }
-    float rel_u = 0.0f;
-    int bad_u = check_against(h_c5, h_ref, M * N, &rel_u);
-    printf("CPU 对拍 (2dblock): %s (max rel err = %.2e)\n",
-           bad_u == 0 ? "PASS" : "FAIL", rel_u);
-    if (bad_u) {
-      printf("  不一致的元素: %d\n", bad_u);
-      return EXIT_FAILURE;
-    }
-    float rel_v = 0.0f;
-    int bad_v = check_against(h_c6, h_ref, M * N, &rel_v);
-    printf("CPU 对拍 (vectorized): %s (max rel err = %.2e)\n",
-           bad_v == 0 ? "PASS" : "FAIL", rel_v);
-    if (bad_v) {
-      printf("  不一致的元素: %d\n", bad_v);
-      return EXIT_FAILURE;
-    }
-    float rel_w = 0.0f;
-    int bad_w = check_against(h_c7, h_ref, M * N, &rel_w);
-    printf("CPU 对拍 (nobank): %s (max rel err = %.2e)\n",
-           bad_w == 0 ? "PASS" : "FAIL", rel_w);
-    if (bad_w) {
-      printf("  不一致的元素: %d\n", bad_w);
-      return EXIT_FAILURE;
-    }
-    float rel_x = 0.0f;
-    int bad_x = check_against(h_c8, h_ref, M * N, &rel_x);
-    printf("CPU 对拍 (warp): %s (max rel err = %.2e)\n",
-           bad_x == 0 ? "PASS" : "FAIL", rel_x);
-    if (bad_x) {
-      printf("  不一致的元素: %d\n", bad_x);
-      return EXIT_FAILURE;
-    }
-    float rel_y = 0.0f;
-    int bad_y = check_against(h_c9, h_ref, M * N, &rel_y);
-    printf("CPU 对拍 (dbuf): %s (max rel err = %.2e)\n",
-           bad_y == 0 ? "PASS" : "FAIL", rel_y);
-    if (bad_y) {
-      printf("  不一致的元素: %d\n", bad_y);
-      return EXIT_FAILURE;
-    }
-    float rel_z = 0.0f;
-    int bad_z = check_against(h_c10, h_ref, M * N, &rel_z);
-    printf("CPU 对拍 (auto): %s (max rel err = %.2e)\n",
-           bad_z == 0 ? "PASS" : "FAIL", rel_z);
-    if (bad_z) {
-      printf("  不一致的元素: %d\n", bad_z);
-      return EXIT_FAILURE;
+    for (int i = 0; i < n_entries; i++) {
+      KernelEntry &e = entries[i];
+      if (!e.ran) continue;
+      float rel = 0.0f;
+      int bad = check_against(e.h_out, h_ref, M * N, &rel);
+      printf("CPU 对拍 (%s): %s (max rel err = %.2e)\n", e.name,
+             bad == 0 ? "PASS" : "FAIL", rel);
+      if (bad) {
+        printf("  不一致的元素: %d\n", bad);
+        return EXIT_FAILURE;
+      }
     }
   } else {
     printf("CPU 对拍: 跳过（尺寸太大）\n");
   }
 
-  // ---- 3. cuBLAS 基线（对比目标） ----
+  // ---- cuBLAS 基线（对比目标） ----
   cublasHandle_t handle;
   CHECK_CUBLAS(cublasCreate(&handle));
   // 显式用默认 FP32 数学模式（TF32 是 opt-in，这里先不开）
@@ -384,95 +330,31 @@ int main(int argc, char **argv) {
   launch_cublas();  // 预热
   CHECK(cudaDeviceSynchronize());
   float ms_cublas = time_ms(launch_cublas, 3);
-  double gflops_cublas = 2.0 * M * N * K / (ms_cublas * 1e6);
-  printf("cublas: %10.3f ms  %10.2f GFLOPS  (naive = %.2f%% of cublas)\n",
-         ms_cublas, gflops_cublas, 100.0 * gflops / gflops_cublas);
+  double gflops_cublas = flops / (ms_cublas * 1e6);
+  if (naive_ran) {
+    printf("cublas: %10.3f ms  %10.2f GFLOPS  (naive = %.2f%% of cublas)\n",
+           ms_cublas, gflops_cublas, 100.0 * naive_gf / gflops_cublas);
+  } else {
+    printf("cublas: %10.3f ms  %10.2f GFLOPS\n", ms_cublas, gflops_cublas);
+  }
 
-  // ---- 4. kernel vs cuBLAS 对拍（两种 GPU 实现互相对比） ----
+  // ---- cuBLAS 对拍（只查本轮跑过的 kernel） ----
   CHECK(cudaMemcpy(h_cblas, d_c, bytes_c, cudaMemcpyDeviceToHost));
-  float rel2 = 0.0f;
-  int bad2 = check_against(h_c, h_cblas, M * N, &rel2);
-  printf("cuBLAS 对拍 (naive): %s (max rel err = %.2e)\n",
-         bad2 == 0 ? "PASS" : "FAIL", rel2);
-  if (bad2) {
-    printf("  不一致的元素: %d\n", bad2);
-    return EXIT_FAILURE;
-  }
-  float rel3 = 0.0f;
-  int bad3 = check_against(h_c2, h_cblas, M * N, &rel3);
-  printf("cuBLAS 对拍 (coalesced): %s (max rel err = %.2e)\n",
-         bad3 == 0 ? "PASS" : "FAIL", rel3);
-  if (bad3) {
-    printf("  不一致的元素: %d\n", bad3);
-    return EXIT_FAILURE;
-  }
-  float rel4 = 0.0f;
-  int bad4 = check_against(h_c3, h_cblas, M * N, &rel4);
-  printf("cuBLAS 对拍 (smem): %s (max rel err = %.2e)\n",
-         bad4 == 0 ? "PASS" : "FAIL", rel4);
-  if (bad4) {
-    printf("  不一致的元素: %d\n", bad4);
-    return EXIT_FAILURE;
-  }
-  float rel5 = 0.0f;
-  int bad5 = check_against(h_c4, h_cblas, M * N, &rel5);
-  printf("cuBLAS 对拍 (1dblock): %s (max rel err = %.2e)\n",
-         bad5 == 0 ? "PASS" : "FAIL", rel5);
-  if (bad5) {
-    printf("  不一致的元素: %d\n", bad5);
-    return EXIT_FAILURE;
-  }
-  float rel6 = 0.0f;
-  int bad6 = check_against(h_c5, h_cblas, M * N, &rel6);
-  printf("cuBLAS 对拍 (2dblock): %s (max rel err = %.2e)\n",
-         bad6 == 0 ? "PASS" : "FAIL", rel6);
-  if (bad6) {
-    printf("  不一致的元素: %d\n", bad6);
-    return EXIT_FAILURE;
-  }
-  float rel7 = 0.0f;
-  int bad7 = check_against(h_c6, h_cblas, M * N, &rel7);
-  printf("cuBLAS 对拍 (vectorized): %s (max rel err = %.2e)\n",
-         bad7 == 0 ? "PASS" : "FAIL", rel7);
-  if (bad7) {
-    printf("  不一致的元素: %d\n", bad7);
-    return EXIT_FAILURE;
-  }
-  float rel8 = 0.0f;
-  int bad8 = check_against(h_c7, h_cblas, M * N, &rel8);
-  printf("cuBLAS 对拍 (nobank): %s (max rel err = %.2e)\n",
-         bad8 == 0 ? "PASS" : "FAIL", rel8);
-  if (bad8) {
-    printf("  不一致的元素: %d\n", bad8);
-    return EXIT_FAILURE;
-  }
-  float rel9 = 0.0f;
-  int bad9 = check_against(h_c8, h_cblas, M * N, &rel9);
-  printf("cuBLAS 对拍 (warp): %s (max rel err = %.2e)\n",
-         bad9 == 0 ? "PASS" : "FAIL", rel9);
-  if (bad9) {
-    printf("  不一致的元素: %d\n", bad9);
-    return EXIT_FAILURE;
-  }
-  float rel10 = 0.0f;
-  int bad10 = check_against(h_c9, h_cblas, M * N, &rel10);
-  printf("cuBLAS 对拍 (dbuf): %s (max rel err = %.2e)\n",
-         bad10 == 0 ? "PASS" : "FAIL", rel10);
-  if (bad10) {
-    printf("  不一致的元素: %d\n", bad10);
-    return EXIT_FAILURE;
-  }
-  float rel11 = 0.0f;
-  int bad11 = check_against(h_c10, h_cblas, M * N, &rel11);
-  printf("cuBLAS 对拍 (auto): %s (max rel err = %.2e)\n",
-         bad11 == 0 ? "PASS" : "FAIL", rel11);
-  if (bad11) {
-    printf("  不一致的元素: %d\n", bad11);
-    return EXIT_FAILURE;
+  for (int i = 0; i < n_entries; i++) {
+    KernelEntry &e = entries[i];
+    if (!e.ran) continue;
+    float rel = 0.0f;
+    int bad = check_against(e.h_out, h_cblas, M * N, &rel);
+    printf("cuBLAS 对拍 (%s): %s (max rel err = %.2e)\n", e.name,
+           bad == 0 ? "PASS" : "FAIL", rel);
+    if (bad) {
+      printf("  不一致的元素: %d\n", bad);
+      return EXIT_FAILURE;
+    }
   }
 
-  // ---- 5. 可选 dump（h_c10 是当前最新 kernel 的结果，供 bench.py 对拍） ----
-  if (dump_path) dump(dump_path, h_c10, M, N, K);
+  // ---- 可选 dump（导出最后跑的那个 kernel 的结果，供 bench.py 对拍） ----
+  if (dump_path) dump(dump_path, last_out, M, N, K);
 
   CHECK_CUBLAS(cublasDestroy(handle));
   CHECK(cudaFree(d_a));
@@ -480,16 +362,7 @@ int main(int argc, char **argv) {
   CHECK(cudaFree(d_c));
   free(h_a);
   free(h_b);
-  free(h_c);
-  free(h_c2);
-  free(h_c3);
-  free(h_c4);
-  free(h_c5);
-  free(h_c6);
-  free(h_c7);
-  free(h_c8);
-  free(h_c9);
-  free(h_c10);
+  for (int i = 0; i < 10; i++) free(h_bufs[i]);
   free(h_ref);
   free(h_cblas);
   return EXIT_SUCCESS;

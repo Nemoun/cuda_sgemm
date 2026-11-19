@@ -12,14 +12,19 @@
 
 ```bash
 bash build.sh                              # 编译
-./sgemm                                    # 默认 1024×1024×1024
+./sgemm                                    # 默认 1024×1024×1024，全部 kernel 按顺序跑
 ./sgemm 512                                # 自定义尺寸 M=N=K=512
 ./sgemm 512 512 1024                       # M N K 分别指定
-./sgemm 1024 --dump c.bin                  # 把 kernel 结果写到二进制文件
+./sgemm --kernel nobank 1024               # 只跑某个 kernel（同样计时 + 三方对拍）
+./sgemm --kernel auto 4096                 # 只跑 autotuning 扫描
+./sgemm 1024 --dump c.bin                  # 把（最后跑的）kernel 结果写到二进制文件
 python3 bench.py 1024 --check c.bin        # numpy 对拍
 ```
 
-每次运行会输出：kernel 与 cuBLAS 的耗时/GFLOPS/比值，以及 CPU 参考对拍和 cuBLAS 对拍结果。
+`--kernel` 可选名字：`naive`、`coalesced`、`smem`、`1dblock`、`2dblock`、
+`vectorized`、`nobank`、`warp`、`dbuf`、`auto`（默认 `all`，全部按顺序跑）。
+
+每次运行会输出：kernel 与 cuBLAS 的耗时/GFLOPS/比值，以及 CPU 参考对拍和 cuBLAS 对拍结果（对拍只覆盖本轮跑过的 kernel）。
 
 ## 目录结构
 
