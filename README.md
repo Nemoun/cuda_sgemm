@@ -22,7 +22,7 @@ python3 bench.py 1024 --check c.bin        # numpy 对拍
 ```
 
 `--kernel` 可选名字：`naive`、`coalesced`、`smem`、`1dblock`、`2dblock`、
-`vectorized`、`nobank`、`warp`、`dbuf`、`auto`、`tc`、`tc2`（默认 `all`，全部按顺序跑）。
+`vectorized`、`nobank`、`warp`、`dbuf`、`auto`、`tc`、`tc2`、`tc3`（默认 `all`，全部按顺序跑）。
 
 每次运行会输出：kernel 与 cuBLAS 的耗时/GFLOPS/比值，以及 CPU 参考对拍和 cuBLAS 对拍结果（对拍只覆盖本轮跑过的 kernel）。
 
@@ -59,7 +59,8 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 - [ ] 10. roofline 图 + 性能曲线绘图（bench.py）
 - [x] 11. Tensor Core v1（wmma TF32，fragment 直载 global）—— 正确性 ✓（max rel err 仅 1.85e-4），速度待 v2 释放（`kernels/10_tensorcore.cuh`）
 - [x] 12. Tensor Core v2（smem tiling）—— 1024³ 达 cuBLAS fp32 的 98.5%（`kernels/11_tensorcore_v2.cuh`）
-- [ ] 13. Tensor Core v3（cp.async 流水 + 3xTF32 精度恢复）
+- [x] 13. Tensor Core v3（cp.async 双缓冲流水）—— 4096³ +7%（`kernels/12_tensorcore_v3.cuh`）
+- [ ] 14. Tensor Core v4（大 tile + 多级流水 + ldmatrix）/ 3xTF32 精度恢复
 
 ## 性能记录
 
@@ -76,7 +77,8 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 | dbuf | 6413.31 | 0.335 ms | 8057.74 | 17.057 ms |
 | autotuned | 8739.27 | 0.246 ms | 10074.89 | 13.642 ms |
 | tc | 5045.40 | 0.426 ms | 2684.52 | 51.197 ms |
-| tc2 | 10082.46 | 0.213 ms | 7319.50 | 18.777 ms |
+| tc2 | 10082.46 | 0.213 ms | 8937.72 | 15.377 ms |
+| tc3 | 9857.35 | 0.218 ms | 10664.13 | 12.888 ms |
 | cuBLAS | 10180.35 | 0.211 ms | 13856.88 | 9.918 ms |
 
 ### 加速比速览（同一次运行，相对 naive）
@@ -99,6 +101,7 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 9. **double buffering**：cp.async 双 barrier（BK=16）的重叠收益随 DRAM 延迟增大而显现——1024³ 慢 21%（L2 命中高、重叠净收益小），4096³ 只慢 9%
 10. **tensorcore v1**（wmma TF32，fragment 直载 global）：正确跑通，实测 max rel err 仅 1.85e-4（远好于预估的 1e-3 量级——确定性小数值数据分布温和）；速度 5045（fragment 从 global 载入、算术强度仅 8 FLOP/B，受载入带宽限制）
 11. **tensorcore v2**（smem tiling + padding 行宽）：1024³ **10082，达到 cuBLAS fp32 的 98.5%**（2× v1）；4096³ 只有 cuBLAS 的 52%——同步搬运的 tile 载入延迟在 DRAM 命中的大尺寸下暴露出来，正是 v3（cp.async 流水）要治的病；边界处理升级为「smem 填 0 + OOB 写回走 per-warp scratch」，比 v1 的标量回退更干净
+12. **tensorcore v3**（cp.async 双缓冲）：FFMA 时代失败的 dbuf 手法在 TC 语境下复活——4096³ 三轮回测 v2→v3 提升 +10%~+32%（平均 ~+18%），1024³ 持平（L2 命中高、无可遮的延迟）；行主序 padded 布局让 cp.async 直接 16B 落位（无 FFMA 时代的 4B scatter 开销）。剩余差距指向更大的 block tile、更多 warp、更深流水与 ldmatrix——v4 的方向
 
 ### autotuning 扫描发现（一期 11 个几何配置 + 二期 40 个三维配置）
 
@@ -116,7 +119,7 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 
 最优配置是 (几何, 布局, 搬运方式) 与尺寸、硬件的联合函数，运行时扫描比手工挑参数可靠。FFMA 路径的搜索空间已基本收敛（dbuf/多级流水路线在 4070 Laptop 上无净收益）。Tensor Core v2 已在 1024³ 追平 cuBLAS fp32，后续方向：
 
-- Tensor Core v3（cp.async 流水——多级流水在 TC 语境下复活，治 4096³ 的载入延迟；3xTF32 精度恢复）
+- Tensor Core v4（大 tile + 多级流水 + ldmatrix）/ 3xTF32 精度恢复
 - roofline 图 + 性能曲线（bench.py 绘图）——收尾产出
 
 ## 参考
