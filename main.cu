@@ -26,6 +26,7 @@
 #include "kernels/10_tensorcore.cuh"
 #include "kernels/11_tensorcore_v2.cuh"
 #include "kernels/12_tensorcore_v3.cuh"
+#include "kernels/13_tensorcore_v4.cuh"
 
 // CUDA API 错误检查
 #define CHECK(call)                                                            \
@@ -169,12 +170,12 @@ int main(int argc, char **argv) {
   size_t bytes_c = (size_t)M * N * sizeof(float);
   float *h_a = (float *)malloc(bytes_a);
   float *h_b = (float *)malloc(bytes_b);
-  float *h_bufs[13];  // 每个 kernel 一个结果 buffer
-  for (int i = 0; i < 13; i++) h_bufs[i] = (float *)malloc(bytes_c);
+  float *h_bufs[14];  // 每个 kernel 一个结果 buffer
+  for (int i = 0; i < 14; i++) h_bufs[i] = (float *)malloc(bytes_c);
   float *h_ref = (float *)malloc(bytes_c);
   float *h_cblas = (float *)malloc(bytes_c);
   bool alloc_ok = h_a && h_b && h_ref && h_cblas;
-  for (int i = 0; i < 13; i++) alloc_ok = alloc_ok && h_bufs[i];
+  for (int i = 0; i < 14; i++) alloc_ok = alloc_ok && h_bufs[i];
   if (!alloc_ok) {
     fprintf(stderr, "host malloc failed\n");
     return EXIT_FAILURE;
@@ -204,6 +205,7 @@ int main(int argc, char **argv) {
       {"tc", "tc:", h_bufs[10], 5e-3f},  // TF32：输入截断误差 ~1e-3，放宽阈值
       {"tc2", "tc2:", h_bufs[11], 5e-3f},
       {"tc3", "tc3:", h_bufs[12], 5e-3f},
+      {"tc4", "tc4:", h_bufs[13], 5e-3f},
   };
   const int n_entries = (int)(sizeof(entries) / sizeof(entries[0]));
 
@@ -272,6 +274,11 @@ int main(int argc, char **argv) {
       CHECK(cudaGetLastError());
       CHECK(cudaDeviceSynchronize());
       e.ms = time_ms([&] { launch_sgemm_tensorcore_v3(d_a, d_b, d_c, M, N, K); }, 3);
+    } else if (strcmp(e.name, "tc4") == 0) {
+      launch_sgemm_tensorcore_v4(d_a, d_b, d_c, M, N, K);
+      CHECK(cudaGetLastError());
+      CHECK(cudaDeviceSynchronize());
+      e.ms = time_ms([&] { launch_sgemm_tensorcore_v4(d_a, d_b, d_c, M, N, K); }, 3);
     } else {
       fprintf(stderr, "未知 kernel: %s\n", e.name);
       exit(EXIT_FAILURE);
@@ -385,7 +392,7 @@ int main(int argc, char **argv) {
   CHECK(cudaFree(d_c));
   free(h_a);
   free(h_b);
-  for (int i = 0; i < 13; i++) free(h_bufs[i]);
+  for (int i = 0; i < 14; i++) free(h_bufs[i]);
   free(h_ref);
   free(h_cblas);
   return EXIT_SUCCESS;
