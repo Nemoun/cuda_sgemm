@@ -57,13 +57,12 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 - [x] 7. warp tiling —— 26× naive，A6000 配置在 4070 Laptop 上慢于 vectorized（见性能记录）（`kernels/7_warptiling.cuh`）
 - [x] 8. double buffering（cp.async）—— 23.8× / 26.4× naive，重叠收益随 DRAM 延迟增大而显现（见性能记录）（`kernels/8_double_buffering.cuh`）
 - [x] 9. autotuning（一期几何扫描 → 二期「几何 × swizzle × dbuf」三维扫描）—— 32.4× / 33.5× naive（`kernels/9_autotuned.cuh`）
-- [ ] 10. roofline 图 + 性能曲线绘图（bench.py）
-- [x] 11. Tensor Core v1（wmma TF32，fragment 直载 global）—— 正确性 ✓（max rel err 仅 1.85e-4），速度待 v2 释放（`kernels/10_tensorcore.cuh`）
-- [x] 12. Tensor Core v2（smem tiling）—— 1024³ 达 cuBLAS fp32 的 98.5%（`kernels/11_tensorcore_v2.cuh`）
-- [x] 13. Tensor Core v3（cp.async 双缓冲流水）—— 4096³ +7%（`kernels/12_tensorcore_v3.cuh`）
-- [x] 14. Tensor Core v4（大 tile 128×128 + 8 warps + BK=32 + 参数化流水）—— 4096³ 达 cuBLAS 的 80%，1024³ 反而更差（见性能记录）（`kernels/13_tensorcore_v4.cuh`）
-- [x] 15. TC 尺寸自适应（按 block 数选 tc3/tc4）—— 全尺寸最优（`kernels/14_tc_adaptive.cuh`）
-- [ ] 16. 3xTF32 精度恢复 / roofline 图收尾
+- [x] 10. Tensor Core v1（wmma TF32，fragment 直载 global）—— 正确性 ✓（max rel err 仅 1.85e-4），速度待 v2 释放（`kernels/10_tensorcore.cuh`）
+- [x] 11. Tensor Core v2（smem tiling）—— 1024³ 达 cuBLAS fp32 的 98.5%（`kernels/11_tensorcore_v2.cuh`）
+- [x] 12. Tensor Core v3（cp.async 双缓冲流水）—— 4096³ +7%（`kernels/12_tensorcore_v3.cuh`）
+- [x] 13. Tensor Core v4（大 tile 128×128 + 8 warps + BK=32 + 参数化流水）—— 4096³ 达 cuBLAS 的 80%，1024³ 反而更差（见性能记录）（`kernels/13_tensorcore_v4.cuh`）
+- [x] 14. TC 尺寸自适应（按 block 数选 tc3/tc4）—— 全尺寸最优（`kernels/14_tc_adaptive.cuh`）
+- [x] 15. roofline 图 + 性能曲线（`plot.py`，见下方「绘图」）
 
 ## 性能记录
 
@@ -85,13 +84,6 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 | tc4 | 8525.01 | 0.252 ms | 11057.05 | 12.430 ms |
 | tcauto | 9845.78 | 0.218 ms | 11079.56 | 12.405 ms |
 | cuBLAS | 10180.35 | 0.211 ms | 13856.88 | 9.918 ms |
-
-### 加速比速览（同一次运行，相对 naive）
-
-- 1024³：coalesced 4.5× → smem 5.9× → 1dblock 15.9× → 2dblock 21.3× → vectorized 29.7× → nobank 31.2× → **autotuned 32.8×**
-- 4096³：coalesced 3.4× → smem 4.7× → 1dblock 15.3× → 2dblock 24.2× → vectorized 28.9× → nobank 30.2× → **autotuned 36.4×**
-- 4096³ 下 autotuned 达到 cuBLAS 的 **80%**
-- 说明：数值为最近一次运行的实测，有 ±5% 波动，看同一次运行的比值更有意义；4096³ 时 CPU 对拍自动跳过（`main.cu` 中 M×N×K > 2^30，CPU 三重循环太慢），只保留 cuBLAS 对拍
 
 ### 优化历程与 ncu 诊断（1024³）
 
@@ -119,15 +111,31 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 - **dbuf 组合在两个尺寸全部落败**：cp.async 双缓冲在这台机器上无净收益，
   结论收敛——多级流水大概率同样落空，不再投入
 - BK=16/32 是甜点、TM=4 是坑；同一个 kernel 不同 tile 尺寸性能差近 2 倍
-- 经验：冠军配置在 plain/swizzle 的 BK=16/32 之间随运行漂移（±5% 噪声）——
-  扫描结果只能当参考，别迷信单次测量的「最优」
+- 经验：最优配置在 plain/swizzle 的 BK=16/32 之间随运行漂移（±5% 噪声）——
+  扫描结果只能当参考，不能相信单次测量的「最优」
 
-### 总结与后续
+### 总结
 
-最优配置是 (几何, 布局, 搬运方式) 与尺寸、硬件的联合函数，运行时扫描比手工挑参数可靠。FFMA 路径的搜索空间已基本收敛（dbuf/多级流水路线在 4070 Laptop 上无净收益）。Tensor Core v2 已在 1024³ 追平 cuBLAS fp32，后续方向：
+最优配置是 (几何, 布局, 搬运方式) 与尺寸、硬件的联合函数，运行时扫描比手工挑参数可靠。FFMA 路径的搜索空间已基本收敛（dbuf/多级流水路线在 4070 Laptop 上无净收益）。Tensor Core v2 已在 1024³ 追平 cuBLAS fp32。
 
-- 3xTF32 精度恢复（3 次 mma 把 TF32 精度恢复到 fp32 级）
-- roofline 图 + 性能曲线（bench.py 绘图）——收尾产出
+## 绘图
+
+```bash
+python3 plot.py                 # 跑 harness 收集数据（1024³ + 4096³）并画图
+python3 plot.py --no-run        # 用缓存的 results.json 重画
+```
+
+输出：
+
+- `performance.png` —— 优化历程：各 kernel 的 GFLOPS（log 轴，双尺寸分组柱状，cuBLAS 虚线参考）
+- `roofline.png` —— 4096³ roofline：横轴算术强度（DRAM 流量口径），屋顶线为
+  内存带宽 512 GB/s、fp32 计算顶 ~19.1 TFLOPS（36 SM × 2.07 GHz 实测）、
+  TF32 TC 顶 ~152.6 TFLOPS；蓝=FFMA 路径、橙=TC 路径、青=cuBLAS
+- `results.json` —— 数据缓存
+
+![性能曲线](performance.png)
+
+![roofline](roofline.png)
 
 ## 参考
 
