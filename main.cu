@@ -23,6 +23,7 @@
 #include "kernels/7_warptiling.cuh"
 #include "kernels/8_double_buffering.cuh"
 #include "kernels/9_autotuned.cuh"
+#include "kernels/10_tensorcore.cuh"
 
 // CUDA API 错误检查
 #define CHECK(call)                                                            \
@@ -86,10 +87,11 @@ float time_ms(F &&launch, int iters) {
   return best;
 }
 
-// ---------- 对拍：|x - ref| <= 1e-3 * (1 + |ref|) 即认为一致 ----------
-// float32 累加顺序不同会带来 ~1e-4 量级的相对误差，阈值 1e-3 足够安全。
+// ---------- 对拍：|x - ref| <= tol * (1 + |ref|) 即认为一致 ----------
+// FFMA 类 kernel 用 1e-3（fp32 累加顺序差异 ~1e-4，余量足够）；
+// TF32 Tensor Core kernel 用 5e-3（TF32 尾数只有 10 位，输入截断误差 ~1e-3）。
 // 相对误差以 ref 的最大绝对值为基准（逐元素除会因 ref≈0 产生虚高的假象）
-int check_against(const float *x, const float *ref, int n, float *max_rel_err) {
+int check_against(const float *x, const float *ref, int n, float tol, float *max_rel_err) {
   float scale = 1e-6f;
   for (int i = 0; i < n; i++) scale = fmaxf(scale, fabsf(ref[i]));
   int bad = 0;
@@ -97,7 +99,7 @@ int check_against(const float *x, const float *ref, int n, float *max_rel_err) {
   for (int i = 0; i < n; i++) {
     float abs_err = fabsf(x[i] - ref[i]);
     max_abs_err = fmaxf(max_abs_err, abs_err);
-    if (abs_err > 1e-3f * (1.0f + fabsf(ref[i]))) bad++;
+    if (abs_err > tol * (1.0f + fabsf(ref[i]))) bad++;
   }
   *max_rel_err = max_abs_err / scale;
   return bad;
@@ -124,6 +126,7 @@ struct KernelEntry {
   const char *name;   // --kernel 参数名
   const char *label;  // 输出标签
   float *h_out;       // 结果 buffer
+  float tol;          // 对拍阈值（FFMA 类 1e-3，TF32 Tensor Core 5e-3）
   bool ran = false;   // 本轮是否运行
   float ms = 0.0f;    // 最快耗时
 };
@@ -164,12 +167,12 @@ int main(int argc, char **argv) {
   size_t bytes_c = (size_t)M * N * sizeof(float);
   float *h_a = (float *)malloc(bytes_a);
   float *h_b = (float *)malloc(bytes_b);
-  float *h_bufs[10];  // 每个 kernel 一个结果 buffer
-  for (int i = 0; i < 10; i++) h_bufs[i] = (float *)malloc(bytes_c);
+  float *h_bufs[11];  // 每个 kernel 一个结果 buffer
+  for (int i = 0; i < 11; i++) h_bufs[i] = (float *)malloc(bytes_c);
   float *h_ref = (float *)malloc(bytes_c);
   float *h_cblas = (float *)malloc(bytes_c);
   bool alloc_ok = h_a && h_b && h_ref && h_cblas;
-  for (int i = 0; i < 10; i++) alloc_ok = alloc_ok && h_bufs[i];
+  for (int i = 0; i < 11; i++) alloc_ok = alloc_ok && h_bufs[i];
   if (!alloc_ok) {
     fprintf(stderr, "host malloc failed\n");
     return EXIT_FAILURE;
@@ -186,16 +189,17 @@ int main(int argc, char **argv) {
 
   // ---- kernel 注册表（顺序即默认执行顺序） ----
   KernelEntry entries[] = {
-      {"naive", "naive:", h_bufs[0]},
-      {"coalesced", "coalesced:", h_bufs[1]},
-      {"smem", "smem:", h_bufs[2]},
-      {"1dblock", "1dblock:", h_bufs[3]},
-      {"2dblock", "2dblock:", h_bufs[4]},
-      {"vectorized", "vectorized:", h_bufs[5]},
-      {"nobank", "nobank:", h_bufs[6]},
-      {"warp", "warp:", h_bufs[7]},
-      {"dbuf", "dbuf:", h_bufs[8]},
-      {"auto", "auto:", h_bufs[9]},
+      {"naive", "naive:", h_bufs[0], 1e-3f},
+      {"coalesced", "coalesced:", h_bufs[1], 1e-3f},
+      {"smem", "smem:", h_bufs[2], 1e-3f},
+      {"1dblock", "1dblock:", h_bufs[3], 1e-3f},
+      {"2dblock", "2dblock:", h_bufs[4], 1e-3f},
+      {"vectorized", "vectorized:", h_bufs[5], 1e-3f},
+      {"nobank", "nobank:", h_bufs[6], 1e-3f},
+      {"warp", "warp:", h_bufs[7], 1e-3f},
+      {"dbuf", "dbuf:", h_bufs[8], 1e-3f},
+      {"auto", "auto:", h_bufs[9], 1e-3f},
+      {"tc", "tc:", h_bufs[10], 5e-3f},  // TF32：输入截断误差 ~1e-3，放宽阈值
   };
   const int n_entries = (int)(sizeof(entries) / sizeof(entries[0]));
 
@@ -249,6 +253,11 @@ int main(int argc, char **argv) {
     } else if (strcmp(e.name, "auto") == 0) {
       // 内部完成配置扫描 + 最优重跑（结果已留在 d_c）
       e.ms = launch_sgemm_autotuned(d_a, d_b, d_c, M, N, K);
+    } else if (strcmp(e.name, "tc") == 0) {
+      launch_sgemm_tensorcore(d_a, d_b, d_c, M, N, K);
+      CHECK(cudaGetLastError());
+      CHECK(cudaDeviceSynchronize());
+      e.ms = time_ms([&] { launch_sgemm_tensorcore(d_a, d_b, d_c, M, N, K); }, 3);
     } else {
       fprintf(stderr, "未知 kernel: %s\n", e.name);
       exit(EXIT_FAILURE);
@@ -303,7 +312,7 @@ int main(int argc, char **argv) {
       KernelEntry &e = entries[i];
       if (!e.ran) continue;
       float rel = 0.0f;
-      int bad = check_against(e.h_out, h_ref, M * N, &rel);
+      int bad = check_against(e.h_out, h_ref, M * N, e.tol, &rel);
       printf("CPU 对拍 (%s): %s (max rel err = %.2e)\n", e.name,
              bad == 0 ? "PASS" : "FAIL", rel);
       if (bad) {
@@ -344,7 +353,7 @@ int main(int argc, char **argv) {
     KernelEntry &e = entries[i];
     if (!e.ran) continue;
     float rel = 0.0f;
-    int bad = check_against(e.h_out, h_cblas, M * N, &rel);
+    int bad = check_against(e.h_out, h_cblas, M * N, e.tol, &rel);
     printf("cuBLAS 对拍 (%s): %s (max rel err = %.2e)\n", e.name,
            bad == 0 ? "PASS" : "FAIL", rel);
     if (bad) {
@@ -362,7 +371,7 @@ int main(int argc, char **argv) {
   CHECK(cudaFree(d_c));
   free(h_a);
   free(h_b);
-  for (int i = 0; i < 10; i++) free(h_bufs[i]);
+  for (int i = 0; i < 11; i++) free(h_bufs[i]);
   free(h_ref);
   free(h_cblas);
   return EXIT_SUCCESS;

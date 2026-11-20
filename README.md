@@ -22,7 +22,7 @@ python3 bench.py 1024 --check c.bin        # numpy 对拍
 ```
 
 `--kernel` 可选名字：`naive`、`coalesced`、`smem`、`1dblock`、`2dblock`、
-`vectorized`、`nobank`、`warp`、`dbuf`、`auto`（默认 `all`，全部按顺序跑）。
+`vectorized`、`nobank`、`warp`、`dbuf`、`auto`、`tc`（默认 `all`，全部按顺序跑）。
 
 每次运行会输出：kernel 与 cuBLAS 的耗时/GFLOPS/比值，以及 CPU 参考对拍和 cuBLAS 对拍结果（对拍只覆盖本轮跑过的 kernel）。
 
@@ -57,7 +57,8 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 - [x] 8. double buffering（cp.async）—— 23.8× / 26.4× naive，重叠收益随 DRAM 延迟增大而显现（见性能记录）（`kernels/8_double_buffering.cuh`）
 - [x] 9. autotuning（一期几何扫描 → 二期「几何 × swizzle × dbuf」三维扫描）—— 32.4× / 33.5× naive（`kernels/9_autotuned.cuh`）
 - [ ] 10. roofline 图 + 性能曲线绘图（bench.py）
-- [ ] 11. Tensor Core（wmma）
+- [x] 11. Tensor Core v1（wmma TF32，fragment 直载 global）—— 正确性 ✓（max rel err 仅 1.85e-4），速度待 v2 释放（`kernels/10_tensorcore.cuh`）
+- [ ] 12. Tensor Core v2（smem tiling）/ v3（cp.async 流水 + 3xTF32 精度恢复）
 
 ## 性能记录
 
@@ -73,6 +74,7 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 | warp | 6990.51 | 0.307 ms | 6100.00 | 22.531 ms |
 | dbuf | 6413.31 | 0.335 ms | 8057.74 | 17.057 ms |
 | autotuned | 8739.27 | 0.246 ms | 10074.89 | 13.642 ms |
+| tc | 5045.40 | 0.426 ms | 2684.52 | 51.197 ms |
 | cuBLAS | 10180.35 | 0.211 ms | 13856.88 | 9.918 ms |
 
 ### 加速比速览（同一次运行，相对 naive）
@@ -93,6 +95,7 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 7. **nobank**：swizzle 布局 + 内积 LDS.128，实测读冲突 0，但 Bs4 散列存储带来 52 万次存储冲突——整体收益有限且不稳定（1024³ +13%、4096³ −1.7%）。与教程作者在 A6000 上的经验一致，这也是文章跳过 bank conflict 章节直接讲 autotuning 的原因
 8. **warp tiling**：教程 A6000 配置（128 线程、128 累加器）在 4070 Laptop 上慢于 vectorized——occupancy 仅 16.7%，8 warps/SM 遮不住访存延迟，「重 ILP 轻 occupancy」水土不服
 9. **double buffering**：cp.async 双 barrier（BK=16）的重叠收益随 DRAM 延迟增大而显现——1024³ 慢 21%（L2 命中高、重叠净收益小），4096³ 只慢 9%
+10. **tensorcore v1**（wmma TF32，fragment 直载 global）：正确跑通，实测 max rel err 仅 1.85e-4（远好于预估的 1e-3 量级——确定性小数值数据分布温和）；速度 5045（fragment 从 global 载入、算术强度仅 8 FLOP/B，受载入带宽限制）
 
 ### autotuning 扫描发现（一期 11 个几何配置 + 二期 40 个三维配置）
 
@@ -108,11 +111,10 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 
 ### 总结与后续
 
-最优配置是 (几何, 布局, 搬运方式) 与尺寸、硬件的联合函数，运行时扫描比手工挑参数可靠。FFMA 路径的搜索空间已基本收敛（dbuf/多级流水路线在 4070 Laptop 上无净收益）。后续可选方向：
+最优配置是 (几何, 布局, 搬运方式) 与尺寸、硬件的联合函数，运行时扫描比手工挑参数可靠。FFMA 路径的搜索空间已基本收敛（dbuf/多级流水路线在 4070 Laptop 上无净收益）。Tensor Core v1 已跑通，后续方向：
 
-- Tensor Core（wmma / mma.sync，TF32）——吞吐量级完全不同，最有分量的下一步
+- Tensor Core v2（smem tiling，fragment 从 smem 载入）+ v3（cp.async 流水——多级流水在 TC 语境下复活；3xTF32 精度恢复）
 - roofline 图 + 性能曲线（bench.py 绘图）——收尾产出
-- （可选）扫描结果持久化，避免每次跑分重扫
 
 ## 参考
 
