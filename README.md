@@ -55,7 +55,7 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 - [x] 6. 消除 bank conflict + smem 读向量化 —— 31× naive，收益有限（见性能记录）（`kernels/6_bank_conflict.cuh`）
 - [x] 7. warp tiling —— 26× naive，A6000 配置在 4070 Laptop 上慢于 vectorized（见性能记录）（`kernels/7_warptiling.cuh`）
 - [x] 8. double buffering（cp.async）—— 23.8× / 26.4× naive，重叠收益随 DRAM 延迟增大而显现（见性能记录）（`kernels/8_double_buffering.cuh`）
-- [x] 9. autotuning（运行时扫 (BM,BN,BK,TM,TN)）—— 32.8× / 36.4× naive，4096³ 达 cuBLAS 的 80%（`kernels/9_autotuned.cuh`）
+- [x] 9. autotuning（一期几何扫描 → 二期「几何 × swizzle × dbuf」三维扫描）—— 32.4× / 33.5× naive（`kernels/9_autotuned.cuh`）
 - [ ] 10. roofline 图 + 性能曲线绘图（bench.py）
 - [ ] 11. Tensor Core（wmma）
 
@@ -72,7 +72,7 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 | nobank | 8388.61 | 0.256 ms | 9243.01 | 14.870 ms |
 | warp | 6990.51 | 0.307 ms | 6100.00 | 22.531 ms |
 | dbuf | 6413.31 | 0.335 ms | 8057.74 | 17.057 ms |
-| autotuned | 8821.99 | 0.243 ms | 11125.48 | 12.354 ms |
+| autotuned | 8739.27 | 0.246 ms | 10074.89 | 13.642 ms |
 | cuBLAS | 10180.35 | 0.211 ms | 13856.88 | 9.918 ms |
 
 ### 加速比速览（同一次运行，相对 naive）
@@ -94,20 +94,25 @@ float32 累加顺序不同会带来 ~1e-4 量级相对误差，阈值取 1e-3。
 8. **warp tiling**：教程 A6000 配置（128 线程、128 累加器）在 4070 Laptop 上慢于 vectorized——occupancy 仅 16.7%，8 warps/SM 遮不住访存延迟，「重 ILP 轻 occupancy」水土不服
 9. **double buffering**：cp.async 双 barrier（BK=16）的重叠收益随 DRAM 延迟增大而显现——1024³ 慢 21%（L2 命中高、重叠净收益小），4096³ 只慢 9%
 
-### autotuning 扫描发现（11 个配置）
+### autotuning 扫描发现（一期 11 个几何配置 + 二期 40 个三维配置）
 
-- **最优配置随尺寸变化**：1024³ 选 (128,128,16,8,8)，4096³ 选 (64,128,16,8,8)——若固定用 1024³ 的最优配置，4096³ 只能到 9830，比自适应少 13%
-- **BK=16 是甜点**（BK=8/32 都更差）；TM=4 与「64×64+BK=32」是坑
-- 同一个 kernel 只差 tile 尺寸，性能差近 2 倍（5935 → 11125）——warp tiling 里程碑「配置不匹配」问题的最终答案
+- **最优配置随尺寸变化**：一期 1024³ 选 (128,128,16,8,8)、4096³ 选 (64,128,16,8,8)；
+  二期 1024³ 选 plain sync (128,128,32,8,8)，4096³ 选 swizzle sync (128,128,16,8,8)
+- **swizzle 的收益随尺寸显现**：1024³ plain 占优，4096³ swizzle 反超 ~6%
+  （读冲突的代价在 DRAM 延迟长的尺寸下更贵）
+- **dbuf 组合在两个尺寸全部落败**：cp.async 双缓冲在这台机器上无净收益，
+  结论收敛——多级流水大概率同样落空，不再投入
+- BK=16/32 是甜点、TM=4 是坑；同一个 kernel 不同 tile 尺寸性能差近 2 倍
+- 经验：冠军配置在 plain/swizzle 的 BK=16/32 之间随运行漂移（±5% 噪声）——
+  扫描结果只能当参考，别迷信单次测量的「最优」
 
 ### 总结与后续
 
-最优配置是 (BM,BN,BK,TM,TN) 与尺寸、硬件的联合函数，运行时扫描比手工挑参数可靠。后续可选方向：
+最优配置是 (几何, 布局, 搬运方式) 与尺寸、硬件的联合函数，运行时扫描比手工挑参数可靠。FFMA 路径的搜索空间已基本收敛（dbuf/多级流水路线在 4070 Laptop 上无净收益）。后续可选方向：
 
-- swizzle / dbuf 变体的第二期扫描
-- 多级流水（3~4 buffer）
-- Tensor Core（wmma）
-- roofline 图收尾（bench.py 绘图）
+- Tensor Core（wmma / mma.sync，TF32）——吞吐量级完全不同，最有分量的下一步
+- roofline 图 + 性能曲线（bench.py 绘图）——收尾产出
+- （可选）扫描结果持久化，避免每次跑分重扫
 
 ## 参考
 
